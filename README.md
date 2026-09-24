@@ -46,6 +46,13 @@ pio device monitor -b 115200
 If multiple serial devices are connected, add `--upload-port` to the upload
 command or set a local port in PlatformIO.
 
+### Web interface development
+
+The dashboard source is [data/index.html](data/index.html). A normal PlatformIO
+build runs `scripts/embed_web.py`, compresses the page with gzip, and embeds it
+in the firmware. No filesystem image or separate web-interface upload is needed.
+Edit the HTML file and run the usual build/upload commands to deploy UI changes.
+
 ## Operation
 
 After startup, open `http://GMK330emulator.local/` or the board's DHCP address and log
@@ -60,16 +67,33 @@ The onboard RGB LED reports communication state:
 
 | LED behavior | Meaning |
 | --- | --- |
-| Slow blue breathing | The inverter has not sent a valid RS485 request recently. This is expected during startup and indicates a missing connection if it continues. |
+| Slow blue breathing | The inverter has not sent a valid RS485 request recently. This is expected during startup. If it continues, activate `Meter1` and set it to `External` in the GoodWe configuration so the inverter polls the emulator. |
 | Off between flashes | The inverter is actively polling the emulator over RS485. |
 | Brief green flash | The latest Grid Meter (P1) read succeeded. |
 | Brief red flash | The latest Grid Meter (P1) read failed. Repeated failures eventually activate the meter-response fail-safe. |
 
 Green and red Grid Meter flashes temporarily override the blue breathing effect.
 
-The runtime-adjustable feedback gains have a hard firmware maximum of `0.33`.
-The defaults are based on one tested installation and must not be assumed safe
-for a different inverter, battery, meter placement, or phase arrangement.
+### Controller defaults
+
+| Setting | Default | Allowed range |
+| --- | ---: | ---: |
+| Normal gain | `0.33` | `0.00-1.00` |
+| Step gain | `0.25` | `0.00-0.33` |
+| Crossing brake gain | `0.15` | `0.00-0.33` |
+| Step threshold | `500 W` | `50-5000 W` |
+| Hold time | `100 ms` | `0-15000 ms` |
+| Ramp time | `1000 ms` | `1000-60000 ms` |
+| Integral freeze | `30000 ms` | `0-120000 ms` |
+| Target import | `0 W` | `-500-500 W` |
+
+Normal gain values above `0.33` are available for testing but reduce stability
+and may cause oscillation. The web interface shows a warning above `0.33` and
+an extreme warning above `0.66`. Step and Crossing brake gains retain a hard
+firmware maximum of `0.33`.
+
+These defaults are based on one tested installation and must not be assumed
+safe for a different inverter, battery, meter placement, or phase arrangement.
 
 ## Safety
 

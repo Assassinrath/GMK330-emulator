@@ -1,0 +1,828 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Grid Meter (P1) GoodWe Control</title>
+    <style>
+      :root {
+        --ink: #172126;
+        --muted: #607078;
+        --line: #d7dee1;
+        --accent: #087f5b;
+        --danger: #b42318;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        font-family: Georgia, serif;
+        max-width: 780px;
+        margin: 32px auto;
+        padding: 0 18px;
+        color: var(--ink);
+        background: #f7f9f8;
+      }
+      header {
+        border-bottom: 3px solid var(--ink);
+        padding-bottom: 14px;
+        margin-bottom: 22px;
+      }
+      h1 {
+        font-size: 1.8rem;
+        margin: 0 0 6px;
+      }
+      .status {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px 18px;
+        font: 14px monospace;
+        color: var(--muted);
+      }
+      .indicator {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: #9aa5aa;
+        box-shadow:
+          0 0 0 2px #fff,
+          0 0 0 3px #9aa5aa;
+      }
+      .dot.inv-ok,
+      .dot.p1-ok {
+        background: #168a5b;
+        animation: greenPulse 1.8s ease-out infinite;
+      }
+      .dot.inv-missing {
+        background: #2474b5;
+        animation: bluePulse 1.8s ease-out infinite;
+      }
+      .dot.p1-bad {
+        background: var(--danger);
+        animation: redPulse 1.8s ease-out infinite;
+      }
+      @keyframes greenPulse {
+        0%,
+        35% {
+          box-shadow:
+            0 0 0 2px #fff,
+            0 0 0 3px #168a5b;
+        }
+        75%,
+        100% {
+          box-shadow:
+            0 0 0 2px #fff,
+            0 0 0 8px #168a5b00;
+        }
+      }
+      @keyframes bluePulse {
+        0%,
+        35% {
+          box-shadow:
+            0 0 0 2px #fff,
+            0 0 0 3px #2474b5;
+        }
+        75%,
+        100% {
+          box-shadow:
+            0 0 0 2px #fff,
+            0 0 0 8px #2474b500;
+        }
+      }
+      @keyframes redPulse {
+        0%,
+        35% {
+          box-shadow:
+            0 0 0 2px #fff,
+            0 0 0 3px #b42318;
+        }
+        75%,
+        100% {
+          box-shadow:
+            0 0 0 2px #fff,
+            0 0 0 8px #b4231800;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .dot.inv-ok,
+        .dot.inv-missing,
+        .dot.p1-ok,
+        .dot.p1-bad {
+          animation: none;
+        }
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 14px 24px;
+      }
+      label {
+        display: grid;
+        grid-template-columns: 1fr 112px;
+        align-items: center;
+        gap: 12px;
+        font-weight: bold;
+      }
+      label small {
+        display: block;
+        color: var(--muted);
+        font-weight: normal;
+        margin-top: 3px;
+      }
+      input {
+        width: 100%;
+        padding: 9px;
+        border: 1px solid #aeb9bd;
+        border-radius: 3px;
+        font: inherit;
+      }
+      section {
+        background: white;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 18px;
+        margin-bottom: 16px;
+      }
+      h2 {
+        font-size: 1.05rem;
+        margin: 0 0 16px;
+      }
+      .label-title {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .help {
+        position: relative;
+        display: inline-grid;
+        place-items: center;
+        width: 18px;
+        height: 18px;
+        border: 1px solid #829198;
+        border-radius: 50%;
+        color: #315d70;
+        background: #fff;
+        font: 700 12px/1 sans-serif;
+        cursor: help;
+      }
+      .help[data-tip]:after {
+        content: attr(data-tip);
+        position: absolute;
+        z-index: 10;
+        left: 50%;
+        bottom: calc(100% + 8px);
+        width: min(300px, 80vw);
+        padding: 10px 12px;
+        border: 1px solid #829198;
+        border-radius: 4px;
+        background: #172126;
+        color: #fff;
+        font: normal 13px/1.4 sans-serif;
+        box-shadow: 0 4px 14px #0004;
+        opacity: 0;
+        visibility: hidden;
+        transform: translateX(-50%);
+        pointer-events: none;
+      }
+      .help[data-tip]:hover:after,
+      .help[data-tip]:focus:after {
+        opacity: 1;
+        visibility: visible;
+      }
+      .help[hidden] {
+        display: none;
+      }
+      .status-help:after {
+        top: calc(100% + 8px);
+        bottom: auto;
+        left: 0;
+        transform: none;
+      }
+      .section-title {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        position: relative;
+      }
+      .general-help {
+        position: relative;
+      }
+      .general-help .help-panel {
+        position: absolute;
+        z-index: 20;
+        top: 26px;
+        left: -120px;
+        width: min(620px, calc(100vw - 56px));
+        max-height: 70vh;
+        overflow: auto;
+        padding: 14px 18px;
+        border: 1px solid #829198;
+        border-radius: 4px;
+        background: #172126;
+        color: #fff;
+        font: normal 14px/1.45 sans-serif;
+        box-shadow: 0 5px 18px #0005;
+        opacity: 0;
+        visibility: hidden;
+        pointer-events: none;
+      }
+      .general-help:hover .help-panel,
+      .general-help:focus-within .help-panel {
+        opacity: 1;
+        visibility: visible;
+        pointer-events: auto;
+      }
+      .help-panel h3 {
+        margin: 12px 0 6px;
+        font-size: 1rem;
+      }
+      .help-panel h3:first-child {
+        margin-top: 0;
+      }
+      .help-panel ol,
+      .help-panel ul {
+        margin: 6px 0 10px;
+        padding-left: 22px;
+      }
+      .help-panel code {
+        background: #ffffff20;
+        padding: 1px 4px;
+        border-radius: 2px;
+      }
+      button,
+      .action {
+        display: inline-block;
+        padding: 10px 14px;
+        border: 0;
+        border-radius: 3px;
+        background: var(--accent);
+        color: white;
+        text-decoration: none;
+        font: inherit;
+        cursor: pointer;
+      }
+      button.stop {
+        background: var(--danger);
+      }
+      button:disabled {
+        background: #839096;
+        cursor: default;
+      }
+      #message,
+      #utilityMessage {
+        min-height: 1.3em;
+        color: var(--accent);
+        font-weight: bold;
+      }
+      .gain-warning {
+        display: none;
+        margin: 10px 0 0;
+        padding: 9px 11px;
+        border-left: 4px solid #c27c0e;
+        background: #fff4d6;
+        color: #704600;
+        font: 600 14px/1.4 sans-serif;
+      }
+      .gain-warning.show {
+        display: block;
+      }
+      .gain-warning.extreme {
+        border-color: var(--danger);
+        background: #ffebe9;
+        color: #8f1710;
+      }
+      .links a {
+        color: #315d70;
+        margin-right: 14px;
+      }
+      .utility {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 9px;
+      }
+      .ip-editor {
+        display: none;
+        margin-top: 14px;
+      }
+      .ip-editor.open {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      .ip-editor input {
+        max-width: 220px;
+      }
+      canvas {
+        display: block;
+        width: 100%;
+        height: 220px;
+        background: #101719;
+        border-radius: 3px;
+      }
+      @media (max-width: 640px) {
+        .grid {
+          grid-template-columns: 1fr;
+        }
+        label {
+          grid-template-columns: 1fr 96px;
+        }
+        .help[data-tip]:after {
+          position: fixed;
+          left: 18px;
+          right: 18px;
+          bottom: 18px;
+          width: auto;
+          transform: none;
+        }
+        .general-help .help-panel {
+          position: fixed;
+          left: 18px;
+          right: 18px;
+          top: 84px;
+          width: auto;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Grid Meter (P1) to GoodWe control</h1>
+      <div id="status" class="status">
+        <span class="indicator"
+          ><i id="p1Dot" class="dot"></i
+          ><span id="p1Status">Grid Meter (P1): checking</span></span
+        ><span class="indicator"
+          ><i id="invDot" class="dot"></i
+          ><span id="invStatus">Inverter listening: checking</span
+          ><span
+            id="invHelp"
+            class="help status-help"
+            tabindex="0"
+            role="img"
+            aria-label="Inverter listening help"
+            data-tip="Activate Meter1 and set it to External in the GoodWe configuration so the inverter polls this meter."
+            hidden
+            >?</span
+          ></span
+        ><span id="controlStatus">Loading...</span>
+      </div>
+    </header>
+    <section>
+      <div class="section-title">
+        <h2>Hybrid response</h2>
+        <span class="general-help"
+          ><span
+            class="help"
+            tabindex="0"
+            role="button"
+            aria-label="How hybrid response works"
+            >?</span
+          ><span class="help-panel" role="tooltip"
+            ><h3>Example: when the kettle switches on</h3>
+            <ol>
+              <li>P1 changes by more than <code>500 W</code>.</li>
+              <li>
+                Effective gain immediately changes from <code>0.33</code> to
+                <code>0.25</code>.
+              </li>
+              <li>
+                It stays at <code>0.25</code> for <code>0.1 seconds</code>.
+              </li>
+              <li>It then starts ramping toward <code>0.33</code>.</li>
+              <li>
+                If grid power crosses the <code>0 W</code> target, gain drops to
+                <code>0.15</code>.
+              </li>
+              <li>
+                It ramps from <code>0.15</code> back to <code>0.33</code> over
+                <code>1 second</code>.
+              </li>
+              <li>The slow bias remains frozen for <code>30 seconds</code>.</li>
+            </ol>
+            <p>A new step over the threshold restarts this sequence.</p>
+            <h3>What to adjust</h3>
+            <p><b>Less export overshoot:</b></p>
+            <ul>
+              <li>
+                Reduce Step gain from <code>0.25</code> to <code>0.22</code>.
+              </li>
+              <li>
+                Reduce Brake gain from <code>0.15</code> to
+                <code>0.10-0.12</code>.
+              </li>
+              <li>
+                Increase Ramp time from <code>1 s</code> toward
+                <code>15 s</code>.
+              </li>
+            </ul>
+            <p><b>Faster initial response:</b></p>
+            <ul>
+              <li>Increase Step gain, but no higher than <code>0.30</code>.</li>
+              <li>Reduce Hold time or Ramp time.</li>
+            </ul>
+            <p>
+              <b>False step detections:</b> increase Step threshold to
+              <code>700-1000 W</code>.
+            </p>
+            <p>
+              <b>Missed appliance changes:</b> reduce it to
+              <code>300-400 W</code>.
+            </p>
+            <p>
+              <b>Steady export after settling:</b> increase Target import, for
+              example from <code>0 W</code> to <code>50 W</code>, then allow the
+              slow bias several minutes to adjust.
+            </p></span
+          ></span
+        >
+      </div>
+      <form id="control">
+        <div class="grid">
+          <label
+            ><span
+              ><span class="label-title"
+                >Normal gain
+                <span
+                  class="help"
+                  tabindex="0"
+                  role="img"
+                  aria-label="Normal gain help"
+                  data-tip="Current default: 0.33. Gain used during stable operation. Higher reduces steady grid error faster but reduces stability. Values up to 1.0 are allowed for testing."
+                  >?</span
+                ></span
+              ><small>Steady-state gain, warning above 0.33</small></span
+            ><input
+              name="normalGain"
+              type="number"
+              min="0"
+              max="1.0"
+              step="0.01"
+              required /></label
+          ><label
+            ><span
+              ><span class="label-title"
+                >Step gain
+                <span
+                  class="help"
+                  tabindex="0"
+                  role="img"
+                  aria-label="Step gain help"
+                  data-tip="Current default: 0.25. Gain immediately after detecting a large load change. Lower values produce a gentler response and less overshoot, but allow a larger or longer initial grid spike."
+                  >?</span
+                ></span
+              ><small>Used immediately after a large change</small></span
+            ><input
+              name="stepGain"
+              type="number"
+              min="0"
+              max="0.33"
+              step="0.01"
+              required /></label
+          ><label
+            ><span
+              ><span class="label-title"
+                >Crossing brake gain
+                <span
+                  class="help"
+                  tabindex="0"
+                  role="img"
+                  aria-label="Crossing brake gain help"
+                  data-tip="Current default: 0.15. Used when grid power crosses the target during a transient. It backs off correction to prevent the inverter continuing past zero."
+                  >?</span
+                ></span
+              ><small>Used when grid power passes the target</small></span
+            ><input
+              name="brakeGain"
+              type="number"
+              min="0"
+              max="0.33"
+              step="0.01"
+              required /></label
+          ><label
+            ><span
+              ><span class="label-title"
+                >Step threshold (W)
+                <span
+                  class="help"
+                  tabindex="0"
+                  role="img"
+                  aria-label="Step threshold help"
+                  data-tip="Current default: 500 W. Minimum change between consecutive P1 samples that starts the hybrid sequence."
+                  >?</span
+                ></span
+              ><small>Change required to start a transient</small></span
+            ><input
+              name="stepThreshold"
+              type="number"
+              min="50"
+              max="5000"
+              step="10"
+              required /></label
+          ><label
+            ><span
+              ><span class="label-title"
+                >Hold time (ms)
+                <span
+                  class="help"
+                  tabindex="0"
+                  role="img"
+                  aria-label="Hold time help"
+                  data-tip="Current default: 100 ms. Time the controller remains at Step gain before it starts returning toward Normal gain."
+                  >?</span
+                ></span
+              ><small>Keep step gain before ramping</small></span
+            ><input
+              name="holdMs"
+              type="number"
+              min="0"
+              max="15000"
+              step="100"
+              required /></label
+          ><label
+            ><span
+              ><span class="label-title"
+                >Ramp time (ms)
+                <span
+                  class="help"
+                  tabindex="0"
+                  role="img"
+                  aria-label="Ramp time help"
+                  data-tip="Current default: 1000 ms. Time used to move smoothly from Step or Brake gain back to Normal gain."
+                  >?</span
+                ></span
+              ><small>Return smoothly to normal gain</small></span
+            ><input
+              name="rampMs"
+              type="number"
+              min="1000"
+              max="60000"
+              step="500"
+              required /></label
+          ><label
+            ><span
+              ><span class="label-title"
+                >Integral freeze (ms)
+                <span
+                  class="help"
+                  tabindex="0"
+                  role="img"
+                  aria-label="Integral freeze help"
+                  data-tip="Current default: 30000 ms. Time the slow bias correction is paused after a detected step. It does not freeze the fast gain response."
+                  >?</span
+                ></span
+              ><small>Pause slow bias after a step</small></span
+            ><input
+              name="freezeMs"
+              type="number"
+              min="0"
+              max="120000"
+              step="1000"
+              required /></label
+          ><label
+            ><span
+              ><span class="label-title"
+                >Target import (W)
+                <span
+                  class="help"
+                  tabindex="0"
+                  role="img"
+                  aria-label="Target import help"
+                  data-tip="Current default: 0 W. Desired physical grid flow. Positive means import; raising this value deliberately maintains an import margin rather than risking export."
+                  >?</span
+                ></span
+              ><small>Positive keeps a small import margin</small></span
+            ><input
+              name="targetImport"
+              type="number"
+              min="-500"
+              max="500"
+              step="1"
+              required
+          /></label>
+        </div>
+        <div id="gainWarning" class="gain-warning" role="alert"></div>
+        <p><button type="submit">Apply and save</button></p>
+        <div id="message"></div>
+      </form>
+    </section>
+    <section>
+      <h2>Live grid response</h2>
+      <canvas id="chart"></canvas>
+    </section>
+    <section>
+      <div class="utility">
+        <button id="toggle" class="stop" onclick="toggle()">Stop polling</button
+        ><button id="logButton" onclick="startLogging()">
+          Start CSV logging</button
+        ><button onclick="toggleIp()">Change Grid Meter (P1) IP</button
+        ><a class="action" href="/logs">CSV logs</a>
+      </div>
+      <div id="ipEditor" class="ip-editor">
+        <input
+          id="p1Ip"
+          inputmode="decimal"
+          aria-label="Grid Meter (P1) IP address"
+        /><button onclick="saveIp()">Save IP</button>
+      </div>
+      <div id="utilityMessage"></div>
+      <p class="links">
+        <a href="/data">Live JSON</a><a href="/log">Serial log</a
+        ><a href="/invraw">Raw registers</a>
+      </p>
+    </section>
+    <script>
+      const f = document.getElementById("control");
+      let paused = false,
+        loaded = false,
+        currentP1Ip = "";
+      async function state() {
+        try {
+          const r = await fetch("/state"),
+            j = await r.json();
+          paused = j.paused;
+          const pd = document.getElementById("p1Dot"),
+            id = document.getElementById("invDot");
+          pd.className = "dot " + (j.p1Reachable ? "p1-ok" : "p1-bad");
+          id.className =
+            "dot " + (j.inverterListening ? "inv-ok" : "inv-missing");
+          document.getElementById("p1Status").textContent =
+            "Grid Meter (P1): " + (j.p1Reachable ? "RUNNING" : "UNREACHABLE");
+          document.getElementById("invStatus").textContent =
+            "Inverter listening: " + (j.inverterListening ? "YES" : "NO");
+          document.getElementById("invHelp").hidden = j.inverterListening;
+          document.getElementById("controlStatus").textContent =
+            (paused ? "PAUSED" : "RUNNING") +
+            " | gain " +
+            j.effectiveGain.toFixed(3) +
+            " | " +
+            j.transient +
+            " | bias " +
+            j.bias.toFixed(1) +
+            " W";
+          const b = document.getElementById("toggle");
+          b.textContent = paused ? "Start polling" : "Stop polling";
+          b.className = paused ? "" : "stop";
+          const lb = document.getElementById("logButton"),
+            ie = document.getElementById("ipEditor");
+          lb.textContent = j.sd ? "CSV logging active" : "Start CSV logging";
+          lb.disabled = j.sd;
+          currentP1Ip = j.p1Ip;
+          if (!ie.classList.contains("open"))
+            document.getElementById("p1Ip").value = currentP1Ip;
+          if (!loaded) {
+            for (const [k, v] of Object.entries(j.config))
+              if (f.elements[k]) f.elements[k].value = v;
+            loaded = true;
+            updateGainWarning();
+          }
+        } catch (e) {}
+      }
+      function updateGainWarning() {
+        const v = Number(f.elements.normalGain.value),
+          w = document.getElementById("gainWarning");
+        if (v > 0.66) {
+          w.className = "gain-warning show extreme";
+          w.textContent =
+            "EXTREME WARNING: Normal gain above 0.66 can cause severe control oscillation. Monitor the system closely.";
+        } else if (v > 0.33) {
+          w.className = "gain-warning show";
+          w.textContent =
+            "Warning: Normal gain above 0.33 reduces stability and may cause oscillation.";
+        } else {
+          w.className = "gain-warning";
+          w.textContent = "";
+        }
+      }
+      f.elements.normalGain.addEventListener("input", updateGainWarning);
+      f.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const m = document.getElementById("message");
+        m.textContent = "Saving...";
+        const r = await fetch("/control", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams(new FormData(f)),
+        });
+        m.textContent = await r.text();
+        if (r.ok) {
+          loaded = false;
+          state();
+        }
+      });
+      async function toggle() {
+        await fetch(paused ? "/resume" : "/pause", { method: "POST" });
+        state();
+      }
+      function toggleIp() {
+        const e = document.getElementById("ipEditor"),
+          opening = !e.classList.contains("open");
+        e.classList.toggle("open");
+        if (opening) {
+          document.getElementById("p1Ip").value = currentP1Ip;
+          document.getElementById("p1Ip").focus();
+        }
+      }
+      async function saveIp() {
+        const m = document.getElementById("utilityMessage"),
+          ip = document.getElementById("p1Ip").value;
+        m.textContent = "Saving Grid Meter (P1) IP...";
+        const r = await fetch("/p1ip", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({ ip }),
+        });
+        m.textContent = await r.text();
+        if (r.ok) {
+          currentP1Ip = ip;
+          document.getElementById("ipEditor").classList.remove("open");
+          state();
+        }
+      }
+      async function startLogging() {
+        const m = document.getElementById("utilityMessage"),
+          b = document.getElementById("logButton");
+        b.disabled = true;
+        m.textContent = "Checking SD card...";
+        try {
+          const r = await fetch("/logging/start", { method: "POST" });
+          m.textContent = await r.text();
+          if (!r.ok) b.disabled = false;
+          state();
+        } catch (e) {
+          m.textContent = "Could not contact the controller";
+          b.disabled = false;
+        }
+      }
+      const points = [],
+        canvas = document.getElementById("chart"),
+        ctx = canvas.getContext("2d");
+      function draw() {
+        const d = devicePixelRatio || 1,
+          w = canvas.clientWidth,
+          h = canvas.clientHeight;
+        canvas.width = w * d;
+        canvas.height = h * d;
+        ctx.scale(d, d);
+        const target = Number(f.elements.targetImport.value) || 0,
+          peak =
+            Math.max(500, ...points.map(Math.abs), Math.abs(target)) * 1.15;
+        const y = (v) => h / 2 - (v / peak) * (h / 2 - 22);
+        ctx.fillStyle = "#101719";
+        ctx.fillRect(0, 0, w, h);
+        ctx.strokeStyle = "#536268";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(0, y(0));
+        ctx.lineTo(w, y(0));
+        ctx.stroke();
+        ctx.setLineDash([5, 5]);
+        ctx.strokeStyle = "#d4a72c";
+        ctx.beginPath();
+        ctx.moveTo(0, y(target));
+        ctx.lineTo(w, y(target));
+        ctx.stroke();
+        ctx.setLineDash([]);
+        if (points.length > 1) {
+          ctx.strokeStyle = "#59c99c";
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          points.forEach((v, i) => {
+            const x = (i * w) / 179;
+            i ? ctx.lineTo(x, y(v)) : ctx.moveTo(x, y(v));
+          });
+          ctx.stroke();
+        }
+        ctx.fillStyle = "#c8d2d5";
+        ctx.font = "12px monospace";
+        ctx.fillText("+" + Math.round(peak) + " W", 8, 16);
+        ctx.fillText(Math.round(-peak) + " W", 8, h - 8);
+        if (points.length)
+          ctx.fillText(
+            "now " + Math.round(points[points.length - 1]) + " W",
+            w - 110,
+            16,
+          );
+      }
+      async function sample() {
+        try {
+          const r = await fetch("/data"),
+            j = await r.json(),
+            p = j.p1.p;
+          points.push(p[0] + p[1] + p[2]);
+          if (points.length > 180) points.shift();
+          draw();
+        } catch (e) {}
+      }
+      state();
+      sample();
+      setInterval(state, 1000);
+      setInterval(sample, 1000);
+      window.addEventListener("resize", draw);
+    </script>
+  </body>
+</html>
