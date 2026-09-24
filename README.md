@@ -1,2 +1,66 @@
-# GMK330-emulator
-Emulate GoodWe GMK330 Grid meter
+# GMK330 emulator
+
+Firmware for a LilyGo T-CAN485 that reads a HomeWizard P1 meter over Wi-Fi and
+emulates a GoodWe GMK330 three-phase grid meter over Modbus RTU. It was developed
+for a GoodWe ET-series inverter configured with an external meter.
+
+The emulator also provides:
+
+- GoodWe meter discovery and binding responses
+- A web interface for live control tuning and diagnostics
+- Read-only inverter diagnostics over Modbus TCP
+- CSV logging to the onboard microSD card
+- Downloadable current and historical CSV logs
+- A fail-safe that stops meter responses after repeated P1 read failures
+
+## Hardware
+
+- LilyGo T-CAN485 (ESP32-WROOM, MAX13487E auto-direction RS485)
+- HomeWizard P1 meter reachable on the same Wi-Fi network
+- GoodWe inverter with the external-meter RS485 connection
+- Optional FAT32 microSD card for CSV logging
+
+RS485 uses TX GPIO 22 and RX GPIO 21 at 9600 baud, 8N1. The onboard microSD
+interface uses MISO 2, MOSI 15, SCLK 14, and CS 13.
+
+## Configuration
+
+1. Copy `include/secrets.example.h` to `include/secrets.h`.
+2. Enter the Wi-Fi SSID/password, choose strong web-interface credentials, and
+	enter the 16-character GMK330 identity observed during meter binding.
+3. Review `P1_IP_DEFAULT` and `INVERTER_IP` near the top of `src/main.cpp`.
+4. Review phase rotation and single-phase splitting options for the installation.
+
+`include/secrets.h` is ignored by Git. Do not commit real credentials.
+
+## Build and upload
+
+Install [PlatformIO](https://platformio.org/), connect the T-CAN485, then run:
+
+```sh
+pio run -e lilygo-t-can485
+pio run -e lilygo-t-can485 -t upload
+pio device monitor -b 115200
+```
+
+If multiple serial devices are connected, add `--upload-port` to the upload
+command or set a local port in PlatformIO.
+
+## Operation
+
+After startup, open `http://p1meter.local/` or the board's DHCP address and log
+in with the configured web credentials. The page exposes hybrid-controller
+settings, current controller state, a rolling grid-power graph, diagnostics,
+pause/resume controls, and CSV downloads. Saved settings are retained in ESP32
+Preferences.
+
+The runtime-adjustable feedback gains have a hard firmware maximum of `0.33`.
+The defaults are based on one tested installation and must not be assumed safe
+for a different inverter, battery, meter placement, or phase arrangement.
+
+## Safety
+
+This firmware participates in inverter power control and is experimental. Verify
+meter polarity, phase mapping, inverter meter-loss behavior, and export limiting
+under supervision before unattended use. Keep the original meter and a recovery
+method available. The software is provided without warranty under the MIT license.
