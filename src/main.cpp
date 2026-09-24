@@ -45,11 +45,12 @@
 // Inverter's own Modbus TCP server (Settings -> Modbus TCP on the inverter/SolarGo),
 // polled read-only so the dashboard can show what the inverter itself sees for
 // Meter1, independent of our RS485 TX and of the SolarGo app's display quirks.
-#define INVERTER_IP           "192.168.1.155"
+#define INVERTER_IP_DEFAULT   "192.168.1.155"
 #define INVERTER_MODBUS_PORT  502
 #define INVERTER_UNIT_ID      0xF7   // GoodWe default for ET/EH/BT/BH family
 #define INVERTER_POLL_MS      2000
 #define INVERTER_TCP_TIMEOUT  800    // ms
+#define INVERTER_STATUS_TIMEOUT_MS 6000
 
 // How often to pull fresh data from the P1 (ms). The DSMR telegram only
 // refreshes ~1x/s, so <500 ms gains nothing; 500 ms keeps data fresh.
@@ -221,6 +222,7 @@ struct InverterMeterDebug {
   int32_t  pvP[4];           // W: ppv1/2/3/4 (35105/35109/35113/35117)
   int32_t  inverterAcP;      // W: total_inverter_power (35138)
   int32_t  batteryP;         // W: pbattery1 (35182)
+  uint16_t batteryMode;      // battery_mode (35184): 2=discharge, 3=charge
   bool     runValid;
   uint32_t runLastOkMs;
 
@@ -318,10 +320,12 @@ static int8_t controlStepErrorSign = 0;
 static uint8_t controlTransientState = 0;  // 0=normal, 1=step hold, 2=brake, 3=ramp
 static bool controlInitialized = false;
 
-// ───────────────────────── P1 IP CONFIG ──────────────────────────
+// ───────────────────────── NETWORK CONFIG ────────────────────────
 static Preferences        prefs;
 static SemaphoreHandle_t  ipMutex = nullptr;
 static String             p1Ip;
+static String             inverterIp;
+static bool               inverterModbusEnabled = true;
 static WebServer          server(80);
 
 // ───────────────────────── SERIAL LOG BUFFER ─────────────────────
@@ -674,6 +678,27 @@ static void setP1Ip(const String &ip) {
   prefs.putString("p1ip", ip);
 }
 
+struct InverterConnectionConfig {
+  String ip;
+  bool enabled;
+};
+
+static InverterConnectionConfig getInverterConnectionConfig() {
+  xSemaphoreTake(ipMutex, portMAX_DELAY);
+  InverterConnectionConfig config = {inverterIp, inverterModbusEnabled};
+  xSemaphoreGive(ipMutex);
+  return config;
+}
+
+static void setInverterConnectionConfig(const String &ip, bool enabled) {
+  xSemaphoreTake(ipMutex, portMAX_DELAY);
+  inverterIp = ip;
+  inverterModbusEnabled = enabled;
+  xSemaphoreGive(ipMutex);
+  prefs.putString("invip", ip);
+  prefs.putBool("inven", enabled);
+}
+
 static String buildP1Url() {
   return "http://" + getP1Ip() + "/api/v1/data";
 }
@@ -936,9 +961,10 @@ static void fetchP1() {
 // total (32-bit, 36019-36026), plus meter_comm_status (36004). Ground truth
 // for what the inverter's control loop actually sees, independent of our
 // RS485 TX and of the SolarGo app's display quirks.
-static bool readInverterMeter(int16_t ap[4], int32_t p[4], int16_t *commStatus, uint16_t raw[45]) {
+static bool readInverterMeter(const String &ip, int16_t ap[4], int32_t p[4],
+                              int16_t *commStatus, uint16_t raw[45]) {
   WiFiClient client;
-  if (!client.connect(INVERTER_IP, INVERTER_MODBUS_PORT, INVERTER_TCP_TIMEOUT)) return false;
+  if (!client.connect(ip.c_str(), INVERTER_MODBUS_PORT, INVERTER_TCP_TIMEOUT)) return false;
 
   // The inverter only answers its documented "READ_METER_DATA" block read
   // (start 0x8CA0/36000, count 0x2D/45 regs) - a sub-range starting mid-block
@@ -993,11 +1019,13 @@ static bool readInverterMeter(int16_t ap[4], int32_t p[4], int16_t *commStatus, 
 // count 0x7D/125 regs) - the same data source that drives the inverter's own
 // app/display, so it should be reliably live even if the meter-data block
 // above reads all-zero/NotOK.
-static bool readInverterRunningData(int16_t *gridActivePower, int16_t backupP[4], int16_t loadP[4],
+static bool readInverterRunningData(const String &ip, int16_t *gridActivePower,
+                                    int16_t backupP[4], int16_t loadP[4],
                                     int32_t pvP[4], int32_t *inverterAcP,
-                                    int32_t *batteryP, uint16_t raw[125]) {
+                                    int32_t *batteryP, uint16_t *batteryMode,
+                                    uint16_t raw[125]) {
   WiFiClient client;
-  if (!client.connect(INVERTER_IP, INVERTER_MODBUS_PORT, INVERTER_TCP_TIMEOUT)) return false;
+  if (!client.connect(ip.c_str(), INVERTER_MODBUS_PORT, INVERTER_TCP_TIMEOUT)) return false;
 
   const uint8_t req[12] = {
     0x00, 0x02,                          // transaction id
@@ -1045,19 +1073,28 @@ static bool readInverterRunningData(int16_t *gridActivePower, int16_t backupP[4]
   for (int k = 0; k < 4; k++) pvP[k] = reg32(pvReg[k]);
   *inverterAcP = reg16(35138);
   *batteryP = reg32(35182);
+  *batteryMode = (uint16_t)reg16(35184);
   for (int k = 0; k < 125; k++) raw[k] = (uint16_t)((d[k * 2] << 8) | d[k * 2 + 1]);
   return true;
 }
 
 static void fetchInverterMeter() {
+  const InverterConnectionConfig config = getInverterConnectionConfig();
+  if (!config.enabled) return;
+
   int16_t ap[4]; int32_t p[4]; int16_t commStatus = 0; uint16_t meterRaw[45];
-  bool ok = (WiFi.status() == WL_CONNECTED) && readInverterMeter(ap, p, &commStatus, meterRaw);
+  bool ok = (WiFi.status() == WL_CONNECTED) &&
+            readInverterMeter(config.ip, ap, p, &commStatus, meterRaw);
 
   int16_t gridActivePower = 0; int16_t backupP[4]; int16_t loadP[4];
-  int32_t pvP[4]; int32_t inverterAcP = 0; int32_t batteryP = 0; uint16_t runRaw[125];
+  int32_t pvP[4]; int32_t inverterAcP = 0; int32_t batteryP = 0;
+  uint16_t batteryMode = 0; uint16_t runRaw[125];
   bool runOk = (WiFi.status() == WL_CONNECTED) &&
-               readInverterRunningData(&gridActivePower, backupP, loadP, pvP,
-                                       &inverterAcP, &batteryP, runRaw);
+               readInverterRunningData(config.ip, &gridActivePower, backupP, loadP, pvP,
+                                       &inverterAcP, &batteryP, &batteryMode, runRaw);
+
+  const InverterConnectionConfig currentConfig = getInverterConnectionConfig();
+  if (!currentConfig.enabled || currentConfig.ip != config.ip) return;
 
   xSemaphoreTake(invMutex, portMAX_DELAY);
   invdbg.valid = ok;
@@ -1075,6 +1112,7 @@ static void fetchInverterMeter() {
     }
     invdbg.inverterAcP = inverterAcP;
     invdbg.batteryP = batteryP;
+    invdbg.batteryMode = batteryMode;
     invdbg.runLastOkMs = millis();
     memcpy(invdbg.runRaw, runRaw, sizeof(runRaw));
   }
@@ -1085,14 +1123,14 @@ static void fetchInverterMeter() {
     logPrintf("[INV] commStatus=%d activeP=%d/%d/%d/%d W meterP=%d/%d/%d/%d W\n",
               commStatus, ap[0], ap[1], ap[2], ap[3], (int)p[0], (int)p[1], (int)p[2], (int)p[3]);
   } else {
-    logPrintf("[INV] Modbus TCP read failed (%s:%d)\n", INVERTER_IP, INVERTER_MODBUS_PORT);
+    logPrintf("[INV] Modbus TCP read failed (%s:%d)\n", config.ip.c_str(), INVERTER_MODBUS_PORT);
   }
   if (runOk) {
     logPrintf("[INV-RUN] grid=%d W backup=%d/%d/%d/%d W load=%d/%d/%d/%d W\n",
               gridActivePower, backupP[0], backupP[1], backupP[2], backupP[3],
               loadP[0], loadP[1], loadP[2], loadP[3]);
   } else {
-    logPrintf("[INV-RUN] Modbus TCP running-data read failed (%s:%d)\n", INVERTER_IP, INVERTER_MODBUS_PORT);
+    logPrintf("[INV-RUN] Modbus TCP running-data read failed (%s:%d)\n", config.ip.c_str(), INVERTER_MODBUS_PORT);
   }
 #endif
 }
@@ -1274,6 +1312,27 @@ static void handleP1Ip() {
   server.send(200, "text/plain", "Grid Meter (P1) IP changed to " + ip);
 }
 
+static void handleInverterConfig() {
+  if (!checkAuth()) return;
+  String ip = server.arg("ip");
+  ip.trim();
+  if (!isValidIp(ip)) {
+    server.send(400, "text/plain", "Invalid inverter IP address");
+    return;
+  }
+  const bool enabled = server.arg("enabled") == "true" || server.arg("enabled") == "1";
+  setInverterConnectionConfig(ip, enabled);
+  xSemaphoreTake(invMutex, portMAX_DELAY);
+  invdbg.valid = false;
+  invdbg.runValid = false;
+  invdbg.lastOkMs = 0;
+  invdbg.runLastOkMs = 0;
+  xSemaphoreGive(invMutex);
+  server.send(200, "text/plain", enabled
+    ? "Inverter Modbus TCP enabled at " + ip
+    : "Inverter Modbus TCP disabled");
+}
+
 static void handleReset() {
   if (!checkAuth()) return;
   setP1Ip(P1_IP_DEFAULT);
@@ -1357,15 +1416,25 @@ static void handleState() {
   xSemaphoreGive(meterMutex);
   const uint32_t rs485Age = lastRs485Ms ? millis() - lastRs485Ms : UINT32_MAX;
   const bool inverterListening = rs485Age <= RS485_LINK_TIMEOUT_MS;
+  const InverterConnectionConfig inverterConfig = getInverterConnectionConfig();
+  xSemaphoreTake(invMutex, portMAX_DELAY);
+  const uint32_t inverterLastOkMs = max(invdbg.lastOkMs, invdbg.runLastOkMs);
+  const bool inverterReadValid = invdbg.valid || invdbg.runValid;
+  xSemaphoreGive(invMutex);
+  const uint32_t inverterModbusAge = inverterLastOkMs ? millis() - inverterLastOkMs : UINT32_MAX;
+  const bool inverterModbusOk = inverterConfig.enabled && inverterReadValid &&
+                                 inverterModbusAge <= INVERTER_STATUS_TIMEOUT_MS;
   const ControlConfig config = getControlConfig();
   const char *transientName = controlTransientState == 1 ? "step hold" :
                               controlTransientState == 2 ? "crossing brake" :
                               controlTransientState == 3 ? "gain ramp" : "normal";
-  char state[768];
+  char state[1024];
   snprintf(state, sizeof(state),
            "{\"paused\":%s,\"downloadReady\":%s,\"sd\":%s,\"p1Reachable\":%s,"
-           "\"p1AgeMs\":%lu,\"p1Ip\":\"%s\",\"inverterListening\":%s,\"bias\":%.2f,"
-           "\"averageRaw\":%.1f,\"effectiveGain\":%.3f,\"transient\":\"%s\","
+           "\"p1AgeMs\":%lu,\"p1Ip\":\"%s\",\"inverterListening\":%s,"
+           "\"inverterModbusEnabled\":%s,\"inverterModbusOk\":%s,"
+           "\"inverterModbusAgeMs\":%lu,\"inverterIp\":\"%s\","
+           "\"bias\":%.2f,\"averageRaw\":%.1f,\"effectiveGain\":%.3f,\"transient\":\"%s\","
            "\"config\":{\"normalGain\":%.3f,\"stepGain\":%.3f,\"brakeGain\":%.3f,"
            "\"stepThreshold\":%.0f,\"holdMs\":%lu,\"rampMs\":%lu,\"freezeMs\":%lu,\"targetImport\":%.0f},"
            "\"rs485AgeMs\":%lu,\"meterAddress\":%u,"
@@ -1375,6 +1444,8 @@ static void handleState() {
            sdPauseAcknowledged ? "true" : "false",
            sdReady ? "true" : "false", p1Reachable ? "true" : "false",
            (unsigned long)p1Age, getP1Ip().c_str(), inverterListening ? "true" : "false",
+           inverterConfig.enabled ? "true" : "false", inverterModbusOk ? "true" : "false",
+           (unsigned long)inverterModbusAge, inverterConfig.ip.c_str(),
            controlBiasW, controlAverageRawW,
            controlEffectiveGain, transientName,
            config.normalGain, config.stepGain, config.brakeGain, config.stepThresholdW,
@@ -1384,6 +1455,58 @@ static void handleState() {
            sdLogPath.c_str(), (unsigned long)sdWrittenBytes, (unsigned long)sdLoggedRows,
            (unsigned long)sdFirstUptimeMs, (unsigned long)sdLatestUptimeMs);
   server.send(200, "application/json", state);
+}
+
+static void handleInverterStatus() {
+  if (!checkAuth()) return;
+  const InverterConnectionConfig config = getInverterConnectionConfig();
+  xSemaphoreTake(invMutex, portMAX_DELAY);
+  const InverterMeterDebug inv = invdbg;
+  xSemaphoreGive(invMutex);
+
+  const uint32_t nowMs = millis();
+  const uint32_t meterAgeMs = inv.lastOkMs ? nowMs - inv.lastOkMs : UINT32_MAX;
+  const uint32_t runAgeMs = inv.runLastOkMs ? nowMs - inv.runLastOkMs : UINT32_MAX;
+  const bool meterOk = config.enabled && inv.valid && meterAgeMs <= INVERTER_STATUS_TIMEOUT_MS;
+  const bool runOk = config.enabled && inv.runValid && runAgeMs <= INVERTER_STATUS_TIMEOUT_MS;
+
+  JsonDocument doc;
+  doc["enabled"] = config.enabled;
+  doc["connected"] = meterOk || runOk;
+  doc["ip"] = config.ip;
+  doc["port"] = INVERTER_MODBUS_PORT;
+  doc["unitId"] = INVERTER_UNIT_ID;
+  doc["meterBlockOk"] = meterOk;
+  doc["runningBlockOk"] = runOk;
+  doc["meterAgeMs"] = meterAgeMs;
+  doc["runningAgeMs"] = runAgeMs;
+  doc["meterCommStatus"] = inv.commStatus;
+  doc["gridPowerW"] = inv.gridActivePower;
+  doc["inverterAcPowerW"] = inv.inverterAcP;
+  doc["batteryPowerW"] = inv.batteryP;
+  doc["batteryMode"] = inv.batteryMode;
+  const char *batteryState = inv.batteryMode == 0 ? "No battery" :
+                             inv.batteryMode == 1 ? "Standby" :
+                             inv.batteryMode == 2 ? "Discharging" :
+                             inv.batteryMode == 3 ? "Charging" :
+                             inv.batteryMode == 4 ? "Waiting to charge" : "Unknown";
+  doc["batteryState"] = batteryState;
+  JsonArray pv = doc["pvPowerW"].to<JsonArray>();
+  JsonArray backup = doc["backupPowerW"].to<JsonArray>();
+  JsonArray load = doc["loadPowerW"].to<JsonArray>();
+  int64_t pvTotal = 0;
+  for (int index = 0; index < 4; index++) {
+    pv.add(inv.pvP[index]);
+    backup.add(inv.backupP[index]);
+    load.add(inv.loadP[index]);
+    pvTotal += inv.pvP[index];
+  }
+  doc["pvTotalW"] = pvTotal;
+
+  String response;
+  response.reserve(640);
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
 }
 
 static void handleStartLogging() {
@@ -1788,6 +1911,8 @@ void setup() {
   sdSpi.begin(SD_SCLK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
   prefs.begin("p1cfg", false);
   p1Ip = prefs.getString("p1ip", P1_IP_DEFAULT);
+  inverterIp = prefs.getString("invip", INVERTER_IP_DEFAULT);
+  inverterModbusEnabled = prefs.getBool("inven", true);
   if (prefs.getUChar("ctrlVer", 0) < CONTROL_CONFIG_VERSION) {
     prefs.putFloat("normGain", CONTROL_FEEDBACK_GAIN);
     prefs.putFloat("stepGain", CONTROL_DEFAULT_STEP_GAIN);
@@ -1830,6 +1955,8 @@ void setup() {
   server.on("/",      HTTP_GET,  handleRoot);
   server.on("/save",  HTTP_POST, handleSave);
   server.on("/p1ip", HTTP_POST, handleP1Ip);
+  server.on("/inverter/config", HTTP_POST, handleInverterConfig);
+  server.on("/inverter/status", HTTP_GET, handleInverterStatus);
   server.on("/reset", HTTP_POST, handleReset);
   server.on("/control", HTTP_POST, handleControl);
   server.on("/pause", HTTP_POST, handlePause);

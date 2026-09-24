@@ -54,7 +54,8 @@
           0 0 0 3px #9aa5aa;
       }
       .dot.inv-ok,
-      .dot.p1-ok {
+      .dot.p1-ok,
+      .dot.modbus-ok {
         background: #168a5b;
         animation: greenPulse 1.8s ease-out infinite;
       }
@@ -62,9 +63,13 @@
         background: #2474b5;
         animation: bluePulse 1.8s ease-out infinite;
       }
-      .dot.p1-bad {
+      .dot.p1-bad,
+      .dot.modbus-bad {
         background: var(--danger);
         animation: redPulse 1.8s ease-out infinite;
+      }
+      .dot.modbus-off {
+        background: #9aa5aa;
       }
       @keyframes greenPulse {
         0%,
@@ -112,7 +117,9 @@
         .dot.inv-ok,
         .dot.inv-missing,
         .dot.p1-ok,
-        .dot.p1-bad {
+        .dot.p1-bad,
+        .dot.modbus-ok,
+        .dot.modbus-bad {
           animation: none;
         }
       }
@@ -317,6 +324,55 @@
       .ip-editor input {
         max-width: 220px;
       }
+      .config-editor {
+        align-items: center;
+      }
+      .config-editor label {
+        display: inline-flex;
+        grid-template-columns: none;
+        gap: 7px;
+        font: 600 14px sans-serif;
+      }
+      .config-editor input[type="checkbox"] {
+        width: 18px;
+        height: 18px;
+        margin: 0;
+      }
+      .status-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 1px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: var(--line);
+      }
+      .status-value {
+        min-width: 0;
+        padding: 12px;
+        background: #fff;
+      }
+      .status-value span {
+        display: block;
+        margin-bottom: 4px;
+        color: var(--muted);
+        font: 12px sans-serif;
+      }
+      .status-value strong {
+        overflow-wrap: anywhere;
+        font: 600 15px monospace;
+      }
+      .status-value strong.charging {
+        color: #168a5b;
+      }
+      .status-value strong.discharging {
+        color: #a45100;
+      }
+      .status-note {
+        margin: 12px 0 0;
+        color: var(--muted);
+        font: 13px/1.4 sans-serif;
+      }
       canvas {
         display: block;
         width: 100%;
@@ -346,6 +402,9 @@
           top: 84px;
           width: auto;
         }
+        .status-grid {
+          grid-template-columns: 1fr 1fr;
+        }
       }
     </style>
   </head>
@@ -369,6 +428,9 @@
             hidden
             >?</span
           ></span
+        ><span class="indicator"
+          ><i id="modbusDot" class="dot modbus-off"></i
+          ><span id="modbusStatus">Inverter Modbus TCP: checking</span></span
         ><span id="controlStatus">Loading...</span>
       </div>
     </header>
@@ -620,6 +682,8 @@
         ><button id="logButton" onclick="startLogging()">
           Start CSV logging</button
         ><button onclick="toggleIp()">Change Grid Meter (P1) IP</button
+        ><button onclick="toggleInverterConfig()">
+          Configure Inverter Modbus</button
         ><a class="action" href="/logs">CSV logs</a>
       </div>
       <div id="ipEditor" class="ip-editor">
@@ -629,32 +693,92 @@
           aria-label="Grid Meter (P1) IP address"
         /><button onclick="saveIp()">Save IP</button>
       </div>
+      <div id="inverterEditor" class="ip-editor config-editor">
+        <label
+          ><input id="inverterEnabled" type="checkbox" /> Enable Modbus
+          TCP</label
+        ><input
+          id="inverterIp"
+          inputmode="decimal"
+          aria-label="Inverter Modbus TCP IP address"
+        /><button onclick="saveInverterConfig()">Save inverter</button>
+      </div>
       <div id="utilityMessage"></div>
       <p class="links">
         <a href="/data">Live JSON</a><a href="/log">Serial log</a
         ><a href="/invraw">Raw registers</a>
       </p>
     </section>
+    <section>
+      <h2>Inverter Modbus TCP status</h2>
+      <div class="status-grid">
+        <div class="status-value">
+          <span>Connection</span><strong id="modbusConnection">Checking</strong>
+        </div>
+        <div class="status-value">
+          <span>Endpoint</span><strong id="modbusEndpoint">-</strong>
+        </div>
+        <div class="status-value">
+          <span>Last update</span><strong id="modbusAge">-</strong>
+        </div>
+        <div class="status-value">
+          <span>Meter communication</span><strong id="meterComm">-</strong>
+        </div>
+        <div class="status-value">
+          <span>Grid power</span><strong id="inverterGrid">-</strong>
+        </div>
+        <div class="status-value">
+          <span>PV total</span><strong id="inverterPv">-</strong>
+        </div>
+        <div class="status-value">
+          <span>Inverter AC</span><strong id="inverterAc">-</strong>
+        </div>
+        <div class="status-value">
+          <span>Battery status</span><strong id="inverterBattery">-</strong>
+        </div>
+        <div class="status-value">
+          <span>Backup / load</span><strong id="inverterLoads">-</strong>
+        </div>
+      </div>
+      <p id="modbusNote" class="status-note">Waiting for inverter status.</p>
+    </section>
     <script>
       const f = document.getElementById("control");
       let paused = false,
         loaded = false,
-        currentP1Ip = "";
+        currentP1Ip = "",
+        currentInverterIp = "",
+        inverterModbusEnabled = true;
       async function state() {
         try {
           const r = await fetch("/state"),
             j = await r.json();
           paused = j.paused;
           const pd = document.getElementById("p1Dot"),
-            id = document.getElementById("invDot");
+            id = document.getElementById("invDot"),
+            md = document.getElementById("modbusDot");
           pd.className = "dot " + (j.p1Reachable ? "p1-ok" : "p1-bad");
           id.className =
             "dot " + (j.inverterListening ? "inv-ok" : "inv-missing");
+          md.className =
+            "dot " +
+            (!j.inverterModbusEnabled
+              ? "modbus-off"
+              : j.inverterModbusOk
+                ? "modbus-ok"
+                : "modbus-bad");
           document.getElementById("p1Status").textContent =
             "Grid Meter (P1): " + (j.p1Reachable ? "RUNNING" : "UNREACHABLE");
           document.getElementById("invStatus").textContent =
             "Inverter listening: " + (j.inverterListening ? "YES" : "NO");
           document.getElementById("invHelp").hidden = j.inverterListening;
+          document.getElementById("modbusStatus").textContent =
+            "Inverter Modbus TCP: " +
+            (!j.inverterModbusEnabled
+              ? "OFF"
+              : j.inverterModbusOk
+                ? "CONNECTED"
+                : "UNREACHABLE");
           document.getElementById("controlStatus").textContent =
             (paused ? "PAUSED" : "RUNNING") +
             " | gain " +
@@ -672,8 +796,16 @@
           lb.textContent = j.sd ? "CSV logging active" : "Start CSV logging";
           lb.disabled = j.sd;
           currentP1Ip = j.p1Ip;
+          currentInverterIp = j.inverterIp;
+          inverterModbusEnabled = j.inverterModbusEnabled;
           if (!ie.classList.contains("open"))
             document.getElementById("p1Ip").value = currentP1Ip;
+          const inverterEditor = document.getElementById("inverterEditor");
+          if (!inverterEditor.classList.contains("open")) {
+            document.getElementById("inverterIp").value = currentInverterIp;
+            document.getElementById("inverterEnabled").checked =
+              inverterModbusEnabled;
+          }
           if (!loaded) {
             for (const [k, v] of Object.entries(j.config))
               if (f.elements[k]) f.elements[k].value = v;
@@ -741,6 +873,36 @@
           currentP1Ip = ip;
           document.getElementById("ipEditor").classList.remove("open");
           state();
+        }
+      }
+      function toggleInverterConfig() {
+        const editor = document.getElementById("inverterEditor"),
+          opening = !editor.classList.contains("open");
+        editor.classList.toggle("open");
+        if (opening) {
+          document.getElementById("inverterIp").value = currentInverterIp;
+          document.getElementById("inverterEnabled").checked =
+            inverterModbusEnabled;
+          document.getElementById("inverterIp").focus();
+        }
+      }
+      async function saveInverterConfig() {
+        const message = document.getElementById("utilityMessage"),
+          ip = document.getElementById("inverterIp").value,
+          enabled = document.getElementById("inverterEnabled").checked;
+        message.textContent = "Saving inverter Modbus settings...";
+        const response = await fetch("/inverter/config", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({ ip, enabled }),
+        });
+        message.textContent = await response.text();
+        if (response.ok) {
+          currentInverterIp = ip;
+          inverterModbusEnabled = enabled;
+          document.getElementById("inverterEditor").classList.remove("open");
+          state();
+          inverterStatus();
         }
       }
       async function startLogging() {
@@ -818,10 +980,77 @@
           draw();
         } catch (e) {}
       }
+      function watts(value) {
+        return Number(value).toLocaleString() + " W";
+      }
+      function age(value) {
+        return value === 4294967295
+          ? "Never"
+          : value < 1000
+            ? value + " ms ago"
+            : (value / 1000).toFixed(1) + " s ago";
+      }
+      async function inverterStatus() {
+        try {
+          const response = await fetch("/inverter/status"),
+            status = await response.json(),
+            connected = status.connected;
+          document.getElementById("modbusConnection").textContent =
+            !status.enabled
+              ? "Disabled"
+              : connected
+                ? "Connected"
+                : "Unreachable";
+          document.getElementById("modbusEndpoint").textContent =
+            status.ip + ":" + status.port;
+          document.getElementById("modbusAge").textContent = !status.enabled
+            ? "-"
+            : age(Math.min(status.meterAgeMs, status.runningAgeMs));
+          document.getElementById("meterComm").textContent = status.meterBlockOk
+            ? status.meterCommStatus === 1
+              ? "OK"
+              : "Not OK"
+            : "-";
+          document.getElementById("inverterGrid").textContent = connected
+            ? watts(status.gridPowerW)
+            : "-";
+          document.getElementById("inverterPv").textContent = connected
+            ? watts(status.pvTotalW)
+            : "-";
+          document.getElementById("inverterAc").textContent = connected
+            ? watts(status.inverterAcPowerW)
+            : "-";
+          document.getElementById("inverterBattery").textContent = connected
+            ? status.batteryState +
+              " · " +
+              watts(Math.abs(status.batteryPowerW))
+            : "-";
+          document.getElementById("inverterLoads").textContent = connected
+            ? watts(status.backupPowerW[3]) +
+              " / " +
+              watts(status.loadPowerW[3])
+            : "-";
+          document.getElementById("modbusNote").textContent = !status.enabled
+            ? "Modbus TCP diagnostics are disabled. RS485 meter emulation continues normally."
+            : "Meter block: " +
+              (status.meterBlockOk ? "current" : "unavailable") +
+              " | Running block: " +
+              (status.runningBlockOk ? "current" : "unavailable") +
+              " | Unit ID: " +
+              status.unitId;
+        } catch (e) {
+          document.getElementById("modbusConnection").textContent =
+            "Unavailable";
+          document.getElementById("modbusNote").textContent =
+            "Could not load inverter Modbus status.";
+        }
+      }
       state();
       sample();
+      inverterStatus();
       setInterval(state, 1000);
       setInterval(sample, 1000);
+      setInterval(inverterStatus, 2000);
       window.addEventListener("resize", draw);
     </script>
   </body>

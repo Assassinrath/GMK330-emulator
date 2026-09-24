@@ -28,7 +28,8 @@ interface uses MISO 2, MOSI 15, SCLK 14, and CS 13.
 1. Copy `include/secrets.example.h` to `include/secrets.h`.
 2. Enter the Wi-Fi SSID/password, choose strong web-interface credentials, and
 	enter the 16-character GMK330 identity observed during meter binding.
-3. Review `P1_IP_DEFAULT` and `INVERTER_IP` near the top of `src/main.cpp`.
+3. Review `P1_IP_DEFAULT` and `INVERTER_IP_DEFAULT` near the top of `src/main.cpp`.
+	Both addresses can be changed later from the dashboard.
 4. Review phase rotation and single-phase splitting options for the installation.
 
 `include/secrets.h` is ignored by Git. Do not commit real credentials.
@@ -61,18 +62,33 @@ settings, current controller state, a rolling grid-power graph, diagnostics,
 pause/resume controls, and CSV downloads. Saved settings are retained in ESP32
 Preferences.
 
+Inverter Modbus TCP diagnostics are enabled by default. Use **Configure Inverter
+Modbus** to change the inverter IP or disable these read-only diagnostics. This
+setting does not disable the RS485 meter emulator. The status section at the
+bottom of the dashboard shows the inverter's grid, PV, AC, battery, backup, and
+load readings when the connection is available. Battery status is decoded from
+the inverter's mode register and reports Charging, Discharging, Standby, Waiting
+to charge, or No battery together with the current power magnitude.
+
+> **Important:** After every LilyGo reboot or power cycle, activate `Meter1` and
+> set it to `External` again in the GoodWe configuration. The inverter will not
+> poll the emulator until this setting is reapplied.
+
 ### Status LED
 
 The onboard RGB LED reports communication state:
 
 | LED behavior | Meaning |
 | --- | --- |
-| Slow blue breathing | The inverter has not sent a valid RS485 request recently. This is expected during startup. If it continues, activate `Meter1` and set it to `External` in the GoodWe configuration so the inverter polls the emulator. |
+| Slow blue breathing | The inverter has not sent a valid RS485 request recently. After every LilyGo reboot, activate `Meter1` and set it to `External` again in the GoodWe configuration so the inverter polls the emulator. |
 | Off between flashes | The inverter is actively polling the emulator over RS485. |
 | Brief green flash | The latest Grid Meter (P1) read succeeded. |
 | Brief red flash | The latest Grid Meter (P1) read failed. Repeated failures eventually activate the meter-response fail-safe. |
 
 Green and red Grid Meter flashes temporarily override the blue breathing effect.
+The dashboard's third indicator pulses green when the separate inverter Modbus
+TCP diagnostics connection is healthy, pulses red when enabled but unreachable,
+and remains gray when disabled.
 
 ### Controller defaults
 
