@@ -48,11 +48,24 @@ command or set a local port in PlatformIO.
 
 ## Operation
 
-After startup, open `http://p1meter.local/` or the board's DHCP address and log
+After startup, open `http://GMK330emulator.local/` or the board's DHCP address and log
 in with the configured web credentials. The page exposes hybrid-controller
 settings, current controller state, a rolling grid-power graph, diagnostics,
 pause/resume controls, and CSV downloads. Saved settings are retained in ESP32
 Preferences.
+
+### Status LED
+
+The onboard RGB LED reports communication state:
+
+| LED behavior | Meaning |
+| --- | --- |
+| Slow blue breathing | The inverter has not sent a valid RS485 request recently. This is expected during startup and indicates a missing connection if it continues. |
+| Off between flashes | The inverter is actively polling the emulator over RS485. |
+| Brief green flash | The latest Grid Meter (P1) read succeeded. |
+| Brief red flash | The latest Grid Meter (P1) read failed. Repeated failures eventually activate the meter-response fail-safe. |
+
+Green and red Grid Meter flashes temporarily override the blue breathing effect.
 
 The runtime-adjustable feedback gains have a hard firmware maximum of `0.33`.
 The defaults are based on one tested installation and must not be assumed safe

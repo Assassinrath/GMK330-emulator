@@ -57,18 +57,20 @@
 #define P1_MAX_FAILS     4            // stop answering inverter after N fails
 #define P1_REBOOT_FAILS  120          // hard reboot after N fails (~60 s)
 
-// Absolute safety ceiling for every runtime-adjustable feedback gain.
-#define CONTROL_FEEDBACK_GAIN 0.33f
+// Normal gain may be raised for testing, while transient gains remain bounded.
+#define CONTROL_FEEDBACK_GAIN       0.33f
+#define CONTROL_NORMAL_GAIN_MAX     1.0f
 
 #define CONTROL_DEFAULT_STEP_GAIN       0.25f
 #define CONTROL_DEFAULT_BRAKE_GAIN      0.15f
-#define CONTROL_DEFAULT_HOLD_MS         2500UL
-#define CONTROL_DEFAULT_RAMP_MS         10000UL
+#define CONTROL_DEFAULT_HOLD_MS         100UL
+#define CONTROL_DEFAULT_RAMP_MS         1000UL
+#define CONTROL_CONFIG_VERSION          2U
 
 // A slow, bounded correction removes the ~100-150 W export offset left by
 // the stable 0.25 fast path. It acts only with fresh, valid inverter meter
 // communication and freezes around large household load changes.
-#define CONTROL_TARGET_IMPORT_W       20.0f
+#define CONTROL_TARGET_IMPORT_W        0.0f
 #define CONTROL_AVERAGE_TAU_MS        45000.0f
 #define CONTROL_INTEGRAL_TIME_MS      900000.0f
 #define CONTROL_BIAS_LIMIT_W          50.0f
@@ -120,17 +122,50 @@
 
 HardwareSerial rs485(2);
 static SPIClass sdSpi(VSPI);
+static volatile uint32_t lastRs485Ms = 0;   // millis() of last valid frame from the inverter
 
-// Onboard WS2812 status LED: green pulse = P1 read OK, red pulse = P1 read failed.
+// Onboard WS2812: green/red flash = P1 read result, breathing blue = inverter absent.
 #define WS2812_PIN       4
 static Adafruit_NeoPixel statusLed(1, WS2812_PIN, NEO_GRB + NEO_KHZ800);
+static portMUX_TYPE ledStateMux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t ledFlashColor = 0;
+static uint32_t ledFlashUntilMs = 0;
 
 static void ledPulse(uint8_t r, uint8_t g, uint8_t b) {
-  statusLed.setPixelColor(0, statusLed.Color(r, g, b));
-  statusLed.show();
-  delay(30);
-  statusLed.setPixelColor(0, 0);
-  statusLed.show();
+  portENTER_CRITICAL(&ledStateMux);
+  ledFlashColor = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+  ledFlashUntilMs = millis() + 60;
+  portEXIT_CRITICAL(&ledStateMux);
+}
+
+static void ledTask(void *) {
+  for (;;) {
+    const uint32_t nowMs = millis();
+    uint32_t flashColor;
+    uint32_t flashUntilMs;
+    portENTER_CRITICAL(&ledStateMux);
+    flashColor = ledFlashColor;
+    flashUntilMs = ledFlashUntilMs;
+    portEXIT_CRITICAL(&ledStateMux);
+
+    if ((int32_t)(flashUntilMs - nowMs) > 0) {
+      statusLed.setPixelColor(0, statusLed.Color(
+        (flashColor >> 16) & 0xFF, (flashColor >> 8) & 0xFF, flashColor & 0xFF));
+    } else {
+      const uint32_t lastFrameMs = lastRs485Ms;
+      const bool inverterMissing = lastFrameMs == 0 || nowMs - lastFrameMs > RS485_LINK_TIMEOUT_MS;
+      if (inverterMissing) {
+        const uint32_t phaseMs = nowMs % 3000UL;
+        const uint32_t riseMs = phaseMs <= 1500UL ? phaseMs : 3000UL - phaseMs;
+        const uint8_t blue = 12 + (riseMs * 108UL) / 1500UL;
+        statusLed.setPixelColor(0, statusLed.Color(0, 0, blue));
+      } else {
+        statusLed.setPixelColor(0, 0);
+      }
+    }
+    statusLed.show();
+    vTaskDelay(pdMS_TO_TICKS(30));
+  }
 }
 
 // ───────────────────────── SHARED METER DATA ─────────────────────
@@ -145,7 +180,6 @@ struct MeterData {
 
 static MeterData        meter      = {};
 static SemaphoreHandle_t meterMutex = nullptr;
-static volatile uint32_t lastRs485Ms = 0;   // millis() of last valid frame from the inverter
 static volatile uint8_t activeMeterAddress = GMK330_NORMAL_ADDR;
 
 // Raw P1 readings (L1/L2/L3, pre-rotation, pre sign-flip) kept only for the /data debug view.
@@ -838,7 +872,7 @@ static void fetchP1() {
   p1dbg.p[0] = p1raw; p1dbg.p[1] = p2raw; p1dbg.p[2] = p3raw;
   xSemaphoreGive(meterMutex);
 
-  if (sdLogQueue) {
+  if (sdLogQueue && sdReady) {
     SdLogSample sample = {};
     sample.uptimeMs = millis();
     const time_t currentTime = time(nullptr);
@@ -1077,41 +1111,56 @@ static void handleRoot() {
   static const char page[] PROGMEM =
     "<!doctype html><html><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>P1 GoodWe Control</title><style>"
+    "<title>Grid Meter (P1) GoodWe Control</title><style>"
     ":root{--ink:#172126;--muted:#607078;--line:#d7dee1;--accent:#087f5b;--danger:#b42318}"
     "*{box-sizing:border-box}body{font-family:Georgia,serif;max-width:780px;margin:32px auto;padding:0 18px;color:var(--ink);background:#f7f9f8}"
     "header{border-bottom:3px solid var(--ink);padding-bottom:14px;margin-bottom:22px}h1{font-size:1.8rem;margin:0 0 6px}"
-    ".status{font-family:monospace;color:var(--muted)}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px 24px}"
+    ".status{display:flex;flex-wrap:wrap;gap:8px 18px;font:14px monospace;color:var(--muted)}.indicator{display:inline-flex;align-items:center;gap:6px}.dot{width:10px;height:10px;border-radius:50%;background:#9aa5aa;box-shadow:0 0 0 2px #fff,0 0 0 3px #9aa5aa}.dot.inv-ok{background:#168a5b;animation:greenPulse 1.8s ease-out infinite}.dot.inv-missing{background:#2474b5;animation:bluePulse 1.8s ease-out infinite}.dot.p1-ok{background:#168a5b;box-shadow:0 0 0 2px #fff,0 0 0 3px #168a5b;animation:statusBlink 1.2s ease-in-out infinite}.dot.p1-bad{background:var(--danger);animation:redPulse 1.8s ease-out infinite}@keyframes greenPulse{0%,35%{box-shadow:0 0 0 2px #fff,0 0 0 3px #168a5b}75%,100%{box-shadow:0 0 0 2px #fff,0 0 0 8px #168a5b00}}@keyframes bluePulse{0%,35%{box-shadow:0 0 0 2px #fff,0 0 0 3px #2474b5}75%,100%{box-shadow:0 0 0 2px #fff,0 0 0 8px #2474b500}}@keyframes redPulse{0%,35%{box-shadow:0 0 0 2px #fff,0 0 0 3px #b42318}75%,100%{box-shadow:0 0 0 2px #fff,0 0 0 8px #b4231800}}@keyframes statusBlink{0%,45%{opacity:1}50%,95%{opacity:.2}100%{opacity:1}}@media(prefers-reduced-motion:reduce){.dot.inv-ok,.dot.inv-missing,.dot.p1-ok,.dot.p1-bad{animation:none}}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px 24px}"
     "label{display:grid;grid-template-columns:1fr 112px;align-items:center;gap:12px;font-weight:bold}"
     "label small{display:block;color:var(--muted);font-weight:normal;margin-top:3px}input{width:100%;padding:9px;border:1px solid #aeb9bd;border-radius:3px;font:inherit}"
     "section{background:white;border:1px solid var(--line);border-radius:6px;padding:18px;margin-bottom:16px}"
-    "h2{font-size:1.05rem;margin:0 0 16px}button,.action{display:inline-block;padding:10px 14px;border:0;border-radius:3px;background:var(--accent);color:white;text-decoration:none;font:inherit;cursor:pointer}"
-    "button.stop{background:var(--danger)}#message{min-height:1.3em;color:var(--accent);font-weight:bold}.links a{color:#315d70;margin-right:14px}"
+    "h2{font-size:1.05rem;margin:0 0 16px}.label-title{display:flex;align-items:center;gap:6px}.help{position:relative;display:inline-grid;place-items:center;width:18px;height:18px;border:1px solid #829198;border-radius:50%;color:#315d70;background:#fff;font:700 12px/1 sans-serif;cursor:help}"
+    ".help[data-tip]:after{content:attr(data-tip);position:absolute;z-index:10;left:50%;bottom:calc(100% + 8px);width:min(300px,80vw);padding:10px 12px;border:1px solid #829198;border-radius:4px;background:#172126;color:#fff;font:normal 13px/1.4 sans-serif;box-shadow:0 4px 14px #0004;opacity:0;visibility:hidden;transform:translateX(-50%);pointer-events:none}"
+    ".help[data-tip]:hover:after,.help[data-tip]:focus:after{opacity:1;visibility:visible}.help[hidden]{display:none}.status-help:after{top:calc(100% + 8px);bottom:auto;left:0;transform:none}.section-title{display:flex;align-items:center;gap:7px;position:relative}.general-help{position:relative}.general-help .help-panel{position:absolute;z-index:20;top:26px;left:-120px;width:min(620px,calc(100vw - 56px));max-height:70vh;overflow:auto;padding:14px 18px;border:1px solid #829198;border-radius:4px;background:#172126;color:#fff;font:normal 14px/1.45 sans-serif;box-shadow:0 5px 18px #0005;opacity:0;visibility:hidden;pointer-events:none}"
+    ".general-help:hover .help-panel,.general-help:focus-within .help-panel{opacity:1;visibility:visible;pointer-events:auto}.help-panel h3{margin:12px 0 6px;font-size:1rem}.help-panel h3:first-child{margin-top:0}.help-panel ol,.help-panel ul{margin:6px 0 10px;padding-left:22px}.help-panel code{background:#ffffff20;padding:1px 4px;border-radius:2px}button,.action{display:inline-block;padding:10px 14px;border:0;border-radius:3px;background:var(--accent);color:white;text-decoration:none;font:inherit;cursor:pointer}"
+    "button.stop{background:var(--danger)}button:disabled{background:#839096;cursor:default}#message,#utilityMessage{min-height:1.3em;color:var(--accent);font-weight:bold}.gain-warning{display:none;margin:10px 0 0;padding:9px 11px;border-left:4px solid #c27c0e;background:#fff4d6;color:#704600;font:600 14px/1.4 sans-serif}.gain-warning.show{display:block}.gain-warning.extreme{border-color:var(--danger);background:#ffebe9;color:#8f1710}.links a{color:#315d70;margin-right:14px}.utility{display:flex;flex-wrap:wrap;gap:9px}.ip-editor{display:none;margin-top:14px}.ip-editor.open{display:flex;flex-wrap:wrap;gap:8px}.ip-editor input{max-width:220px}"
     "canvas{display:block;width:100%;height:220px;background:#101719;border-radius:3px}"
-    "@media(max-width:640px){.grid{grid-template-columns:1fr}label{grid-template-columns:1fr 96px}}"
-    "</style></head><body><header><h1>P1 to GoodWe control</h1><div id='status' class='status'>Loading...</div></header>"
-    "<section><h2>Hybrid response</h2><form id='control'><div class='grid'>"
-    "<label><span>Normal gain<small>Steady-state gain, hard maximum 0.33</small></span><input name='normalGain' type='number' min='0' max='0.33' step='0.01' required></label>"
-    "<label><span>Step gain<small>Used immediately after a large change</small></span><input name='stepGain' type='number' min='0' max='0.33' step='0.01' required></label>"
-    "<label><span>Crossing brake gain<small>Used when grid power passes the target</small></span><input name='brakeGain' type='number' min='0' max='0.33' step='0.01' required></label>"
-    "<label><span>Step threshold (W)<small>Change required to start a transient</small></span><input name='stepThreshold' type='number' min='50' max='5000' step='10' required></label>"
-    "<label><span>Hold time (ms)<small>Keep step gain before ramping</small></span><input name='holdMs' type='number' min='0' max='15000' step='100' required></label>"
-    "<label><span>Ramp time (ms)<small>Return smoothly to normal gain</small></span><input name='rampMs' type='number' min='1000' max='60000' step='500' required></label>"
-    "<label><span>Integral freeze (ms)<small>Pause slow bias after a step</small></span><input name='freezeMs' type='number' min='0' max='120000' step='1000' required></label>"
-    "<label><span>Target import (W)<small>Positive keeps a small import margin</small></span><input name='targetImport' type='number' min='-500' max='500' step='1' required></label>"
-    "</div><p><button type='submit'>Apply and save</button></p><div id='message'></div></form></section>"
+    "@media(max-width:640px){.grid{grid-template-columns:1fr}label{grid-template-columns:1fr 96px}.help[data-tip]:after{position:fixed;left:18px;right:18px;bottom:18px;width:auto;transform:none}.general-help .help-panel{position:fixed;left:18px;right:18px;top:84px;width:auto}}"
+    "</style></head><body><header><h1>Grid Meter (P1) to GoodWe control</h1><div id='status' class='status'><span class='indicator'><i id='p1Dot' class='dot'></i><span id='p1Status'>Grid Meter (P1): checking</span></span><span class='indicator'><i id='invDot' class='dot'></i><span id='invStatus'>Inverter listening: checking</span><span id='invHelp' class='help status-help' tabindex='0' role='img' aria-label='Inverter listening help' data-tip='Activate Meter1 and set it to External in the GoodWe configuration so the inverter polls this meter.' hidden>?</span></span><span id='controlStatus'>Loading...</span></div></header>"
+    "<section><div class='section-title'><h2>Hybrid response</h2><span class='general-help'><span class='help' tabindex='0' role='button' aria-label='How hybrid response works'>?</span><span class='help-panel' role='tooltip'>"
+    "<h3>Example: when the kettle switches on</h3><ol><li>P1 changes by more than <code>500 W</code>.</li><li>Effective gain immediately changes from <code>0.33</code> to <code>0.25</code>.</li><li>It stays at <code>0.25</code> for <code>0.1 seconds</code>.</li><li>It then starts ramping toward <code>0.33</code>.</li><li>If grid power crosses the <code>0 W</code> target, gain drops to <code>0.15</code>.</li><li>It ramps from <code>0.15</code> back to <code>0.33</code> over <code>1 second</code>.</li><li>The slow bias remains frozen for <code>30 seconds</code>.</li></ol><p>A new step over the threshold restarts this sequence.</p>"
+    "<h3>What to adjust</h3><p><b>Less export overshoot:</b></p><ul><li>Reduce Step gain from <code>0.25</code> to <code>0.22</code>.</li><li>Reduce Brake gain from <code>0.15</code> to <code>0.10-0.12</code>.</li><li>Increase Ramp time from <code>1 s</code> toward <code>15 s</code>.</li></ul><p><b>Faster initial response:</b></p><ul><li>Increase Step gain, but no higher than <code>0.30</code>.</li><li>Reduce Hold time or Ramp time.</li></ul><p><b>False step detections:</b> increase Step threshold to <code>700-1000 W</code>.</p><p><b>Missed appliance changes:</b> reduce it to <code>300-400 W</code>.</p><p><b>Steady export after settling:</b> increase Target import, for example from <code>0 W</code> to <code>50 W</code>, then allow the slow bias several minutes to adjust.</p>"
+    "</span></span></div><form id='control'><div class='grid'>"
+    "<label><span><span class='label-title'>Normal gain <span class='help' tabindex='0' role='img' aria-label='Normal gain help' data-tip='Current default: 0.33. Gain used during stable operation. Higher reduces steady grid error faster but reduces stability. Values up to 1.0 are allowed for testing.'>?</span></span><small>Steady-state gain, warning above 0.33</small></span><input name='normalGain' type='number' min='0' max='1.0' step='0.01' required></label>"
+    "<label><span><span class='label-title'>Step gain <span class='help' tabindex='0' role='img' aria-label='Step gain help' data-tip='Current default: 0.25. Gain immediately after detecting a large load change. Lower values produce a gentler response and less overshoot, but allow a larger or longer initial grid spike.'>?</span></span><small>Used immediately after a large change</small></span><input name='stepGain' type='number' min='0' max='0.33' step='0.01' required></label>"
+    "<label><span><span class='label-title'>Crossing brake gain <span class='help' tabindex='0' role='img' aria-label='Crossing brake gain help' data-tip='Current default: 0.15. Used when grid power crosses the target during a transient. It backs off correction to prevent the inverter continuing past zero.'>?</span></span><small>Used when grid power passes the target</small></span><input name='brakeGain' type='number' min='0' max='0.33' step='0.01' required></label>"
+    "<label><span><span class='label-title'>Step threshold (W) <span class='help' tabindex='0' role='img' aria-label='Step threshold help' data-tip='Current default: 500 W. Minimum change between consecutive P1 samples that starts the hybrid sequence.'>?</span></span><small>Change required to start a transient</small></span><input name='stepThreshold' type='number' min='50' max='5000' step='10' required></label>"
+    "<label><span><span class='label-title'>Hold time (ms) <span class='help' tabindex='0' role='img' aria-label='Hold time help' data-tip='Current default: 100 ms. Time the controller remains at Step gain before it starts returning toward Normal gain.'>?</span></span><small>Keep step gain before ramping</small></span><input name='holdMs' type='number' min='0' max='15000' step='100' required></label>"
+    "<label><span><span class='label-title'>Ramp time (ms) <span class='help' tabindex='0' role='img' aria-label='Ramp time help' data-tip='Current default: 1000 ms. Time used to move smoothly from Step or Brake gain back to Normal gain.'>?</span></span><small>Return smoothly to normal gain</small></span><input name='rampMs' type='number' min='1000' max='60000' step='500' required></label>"
+    "<label><span><span class='label-title'>Integral freeze (ms) <span class='help' tabindex='0' role='img' aria-label='Integral freeze help' data-tip='Current default: 30000 ms. Time the slow bias correction is paused after a detected step. It does not freeze the fast gain response.'>?</span></span><small>Pause slow bias after a step</small></span><input name='freezeMs' type='number' min='0' max='120000' step='1000' required></label>"
+    "<label><span><span class='label-title'>Target import (W) <span class='help' tabindex='0' role='img' aria-label='Target import help' data-tip='Current default: 0 W. Desired physical grid flow. Positive means import; raising this value deliberately maintains an import margin rather than risking export.'>?</span></span><small>Positive keeps a small import margin</small></span><input name='targetImport' type='number' min='-500' max='500' step='1' required></label>"
+    "</div><div id='gainWarning' class='gain-warning' role='alert'></div><p><button type='submit'>Apply and save</button></p><div id='message'></div></form></section>"
     "<section><h2>Live grid response</h2><canvas id='chart'></canvas></section>"
-    "<section><button id='toggle' class='stop' onclick='toggle()'>Stop polling</button> <a class='action' href='/logs'>CSV logs</a>"
+    "<section><div class='utility'><button id='toggle' class='stop' onclick='toggle()'>Stop polling</button><button id='logButton' onclick='startLogging()'>Start CSV logging</button><button onclick='toggleIp()'>Change Grid Meter (P1) IP</button><a class='action' href='/logs'>CSV logs</a></div>"
+    "<div id='ipEditor' class='ip-editor'><input id='p1Ip' inputmode='decimal' aria-label='Grid Meter (P1) IP address'><button onclick='saveIp()'>Save IP</button></div><div id='utilityMessage'></div>"
     "<p class='links'><a href='/data'>Live JSON</a><a href='/log'>Serial log</a><a href='/invraw'>Raw registers</a></p></section>"
-    "<script>const f=document.getElementById('control');let paused=false,loaded=false;"
+    "<script>const f=document.getElementById('control');let paused=false,loaded=false,currentP1Ip='';"
     "async function state(){try{const r=await fetch('/state'),j=await r.json();paused=j.paused;"
-    "document.getElementById('status').textContent=(paused?'PAUSED':'RUNNING')+' | effective gain '+j.effectiveGain.toFixed(3)+' | '+j.transient+' | bias '+j.bias.toFixed(1)+' W';"
+    "const pd=document.getElementById('p1Dot'),id=document.getElementById('invDot');pd.className='dot '+(j.p1Reachable?'p1-ok':'p1-bad');id.className='dot '+(j.inverterListening?'inv-ok':'inv-missing');"
+    "document.getElementById('p1Status').textContent='Grid Meter (P1): '+(j.p1Reachable?'RUNNING':'UNREACHABLE');document.getElementById('invStatus').textContent='Inverter listening: '+(j.inverterListening?'YES':'NO');document.getElementById('invHelp').hidden=j.inverterListening;"
+    "document.getElementById('controlStatus').textContent=(paused?'PAUSED':'RUNNING')+' | gain '+j.effectiveGain.toFixed(3)+' | '+j.transient+' | bias '+j.bias.toFixed(1)+' W';"
     "const b=document.getElementById('toggle');b.textContent=paused?'Start polling':'Stop polling';b.className=paused?'':'stop';"
-    "if(!loaded){for(const [k,v] of Object.entries(j.config))if(f.elements[k])f.elements[k].value=v;loaded=true;}}catch(e){}}"
+    "const lb=document.getElementById('logButton'),ie=document.getElementById('ipEditor');lb.textContent=j.sd?'CSV logging active':'Start CSV logging';lb.disabled=j.sd;currentP1Ip=j.p1Ip;if(!ie.classList.contains('open'))document.getElementById('p1Ip').value=currentP1Ip;"
+    "if(!loaded){for(const [k,v] of Object.entries(j.config))if(f.elements[k])f.elements[k].value=v;loaded=true;updateGainWarning();}}catch(e){}}"
+    "function updateGainWarning(){const v=Number(f.elements.normalGain.value),w=document.getElementById('gainWarning');if(v>0.66){w.className='gain-warning show extreme';w.textContent='EXTREME WARNING: Normal gain above 0.66 can cause severe control oscillation. Monitor the system closely.';}else if(v>0.33){w.className='gain-warning show';w.textContent='Warning: Normal gain above 0.33 reduces stability and may cause oscillation.';}else{w.className='gain-warning';w.textContent='';}}"
+    "f.elements.normalGain.addEventListener('input',updateGainWarning);"
     "f.addEventListener('submit',async e=>{e.preventDefault();const m=document.getElementById('message');m.textContent='Saving...';"
     "const r=await fetch('/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(new FormData(f))});"
     "m.textContent=await r.text();if(r.ok){loaded=false;state();}});"
     "async function toggle(){await fetch(paused?'/resume':'/pause',{method:'POST'});state()}"
+    "function toggleIp(){const e=document.getElementById('ipEditor'),opening=!e.classList.contains('open');e.classList.toggle('open');if(opening){document.getElementById('p1Ip').value=currentP1Ip;document.getElementById('p1Ip').focus();}}"
+    "async function saveIp(){const m=document.getElementById('utilityMessage'),ip=document.getElementById('p1Ip').value;m.textContent='Saving Grid Meter (P1) IP...';const r=await fetch('/p1ip',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({ip})});m.textContent=await r.text();if(r.ok){currentP1Ip=ip;document.getElementById('ipEditor').classList.remove('open');state();}}"
+    "async function startLogging(){const m=document.getElementById('utilityMessage'),b=document.getElementById('logButton');b.disabled=true;m.textContent='Checking SD card...';try{const r=await fetch('/logging/start',{method:'POST'});m.textContent=await r.text();if(!r.ok)b.disabled=false;state();}catch(e){m.textContent='Could not contact the controller';b.disabled=false;}}"
     "const points=[],canvas=document.getElementById('chart'),ctx=canvas.getContext('2d');"
     "function draw(){const d=devicePixelRatio||1,w=canvas.clientWidth,h=canvas.clientHeight;canvas.width=w*d;canvas.height=h*d;ctx.scale(d,d);"
     "const target=Number(f.elements.targetImport.value)||0,peak=Math.max(500,...points.map(Math.abs),Math.abs(target))*1.15;"
@@ -1123,6 +1172,8 @@ static void handleRoot() {
     "if(points.length)ctx.fillText('now '+Math.round(points[points.length-1])+' W',w-110,16);}"
     "async function sample(){try{const r=await fetch('/data'),j=await r.json(),p=j.p1.p;points.push(p[0]+p[1]+p[2]);if(points.length>180)points.shift();draw();}catch(e){}}"
     "state();sample();setInterval(state,1000);setInterval(sample,1000);window.addEventListener('resize',draw);</script></body></html>";
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.sendHeader("Pragma", "no-cache");
   server.send_P(200, "text/html", page);
   return;
 
@@ -1145,7 +1196,7 @@ static void handleRoot() {
   String html =
     "<!DOCTYPE html><html><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>P1 Meter Config</title>"
+    "<title>Grid Meter (P1) Config</title>"
     "<style>body{font-family:sans-serif;max-width:900px;margin:40px auto;padding:0 16px}"
     "input{width:100%;padding:8px;margin:8px 0;box-sizing:border-box;font-size:1em}"
     "button{padding:8px 16px;margin-right:8px;font-size:1em}"
@@ -1163,7 +1214,7 @@ static void handleRoot() {
     ".panel th:first-child,.panel td:first-child{text-align:left;color:#aaa}"
     ".pos{color:#4caf50}.neg{color:#f44336}"
     "</style></head><body>"
-    "<h2>P1 &rarr; GoodWe GMK330 Emulator</h2>"
+    "<h2>Grid Meter (P1) &rarr; GoodWe GMK330 Emulator</h2>"
     "<p>Meter status: <b>" + String(valid ? "OK" : "HOLD") + "</b> (fails: " + String(fails) + ")<br>"
     "Inverter (RS485): <b>" + rs485Status + "</b><br>"
     "Uptime: " + String(millis() / 1000UL) + " s<br>"
@@ -1172,7 +1223,7 @@ static void handleRoot() {
     + (sdReady ? " (<a href='/sdlog'>download current CSV</a>, dropped rows: " + String(sdDroppedRows) + ")" : "") + "</p>"
     "<h3>Live debug</h3>"
     "<div class='dash'>"
-    "<div class='panel'><h4>Source &mdash; P1 meter</h4>"
+    "<div class='panel'><h4>Source &mdash; Grid Meter (P1)</h4>"
     "<table><tr><th>Phase</th><th>Voltage</th><th>Current</th><th>Power</th></tr>"
     "<tr><td>L1</td><td id='p1v0'>&ndash;</td><td id='p1i0'>&ndash;</td><td id='p1p0'>&ndash;</td></tr>"
     "<tr><td>L2</td><td id='p1v1'>&ndash;</td><td id='p1i1'>&ndash;</td><td id='p1p1'>&ndash;</td></tr>"
@@ -1211,12 +1262,12 @@ static void handleRoot() {
     "</div>"
     "<p><a href='/invraw' target='_blank'>View raw Modbus TCP registers (both blocks, all 170 regs)</a></p>"
     "<form method='POST' action='/save'>"
-    "<label>P1 meter IP address</label>"
+    "<label>Grid Meter (P1) IP address</label>"
     "<input name='ip' value='" + getP1Ip() + "' required>"
     "<button type='submit'>Save</button>"
     "</form>"
     "<form method='POST' action='/reset' "
-    "onsubmit=\"return confirm('Reset P1 IP to default (" P1_IP_DEFAULT ")?');\">"
+    "onsubmit=\"return confirm('Reset Grid Meter (P1) IP to default (" P1_IP_DEFAULT ")?');\">"
     "<button type='submit'>Reset to default</button>"
     "</form>"
     "<h3>Serial log</h3>"
@@ -1271,10 +1322,10 @@ static void handleRoot() {
     static const char fallback[] PROGMEM =
       "<!doctype html><html><head><meta charset='utf-8'>"
       "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-      "<title>P1 Meter</title><style>body{font-family:sans-serif;max-width:560px;"
+      "<title>Grid Meter (P1)</title><style>body{font-family:sans-serif;max-width:560px;"
       "margin:40px auto;padding:0 16px}a{display:inline-block;padding:12px 16px;"
       "background:#1769aa;color:white;text-decoration:none;border-radius:4px}</style>"
-      "</head><body><h2>P1 to GoodWe meter</h2>"
+      "</head><body><h2>Grid Meter (P1) to GoodWe meter</h2>"
       "<p>The compact page is active because the full dashboard exceeded available memory.</p>"
       "<p><a href='/sdlog'>Download current CSV log</a></p>"
       "<p><a href='/data' style='background:#555'>View live JSON data</a></p>"
@@ -1431,6 +1482,18 @@ static void handleSave() {
   server.send(303);
 }
 
+static void handleP1Ip() {
+  if (!checkAuth()) return;
+  String ip = server.arg("ip");
+  ip.trim();
+  if (!isValidIp(ip)) {
+    server.send(400, "text/plain", "Invalid IP address");
+    return;
+  }
+  setP1Ip(ip);
+  server.send(200, "text/plain", "Grid Meter (P1) IP changed to " + ip);
+}
+
 static void handleReset() {
   if (!checkAuth()) return;
   setP1Ip(P1_IP_DEFAULT);
@@ -1460,7 +1523,7 @@ static bool parseUintArg(const char *name, uint32_t minimum, uint32_t maximum, u
 static void handleControl() {
   if (!checkAuth()) return;
   ControlConfig next;
-  if (!parseFloatArg("normalGain", 0.0f, CONTROL_FEEDBACK_GAIN, next.normalGain) ||
+  if (!parseFloatArg("normalGain", 0.0f, CONTROL_NORMAL_GAIN_MAX, next.normalGain) ||
       !parseFloatArg("stepGain", 0.0f, CONTROL_FEEDBACK_GAIN, next.stepGain) ||
       !parseFloatArg("brakeGain", 0.0f, CONTROL_FEEDBACK_GAIN, next.brakeGain) ||
       !parseFloatArg("stepThreshold", 50.0f, 5000.0f, next.stepThresholdW) ||
@@ -1468,7 +1531,7 @@ static void handleControl() {
       !parseUintArg("holdMs", 0, 15000, next.holdMs) ||
       !parseUintArg("rampMs", 1000, 60000, next.rampMs) ||
       !parseUintArg("freezeMs", 0, 120000, next.integralFreezeMs)) {
-    server.send(400, "text/plain", "Invalid settings. Gains must be between 0.00 and 0.33.");
+    server.send(400, "text/plain", "Invalid settings. Normal gain must be 0.00-1.00; Step and Brake gains must be 0.00-0.33.");
     return;
   }
 
@@ -1508,14 +1571,20 @@ static void handleResume() {
 
 static void handleState() {
   if (!checkAuth()) return;
+  xSemaphoreTake(meterMutex, portMAX_DELAY);
+  const bool p1Reachable = meter.valid;
+  const uint32_t p1Age = meter.lastOkMs ? millis() - meter.lastOkMs : UINT32_MAX;
+  xSemaphoreGive(meterMutex);
   const uint32_t rs485Age = lastRs485Ms ? millis() - lastRs485Ms : UINT32_MAX;
+  const bool inverterListening = rs485Age <= RS485_LINK_TIMEOUT_MS;
   const ControlConfig config = getControlConfig();
   const char *transientName = controlTransientState == 1 ? "step hold" :
                               controlTransientState == 2 ? "crossing brake" :
                               controlTransientState == 3 ? "gain ramp" : "normal";
-  char state[640];
+  char state[768];
   snprintf(state, sizeof(state),
-           "{\"paused\":%s,\"downloadReady\":%s,\"sd\":%s,\"bias\":%.2f,"
+           "{\"paused\":%s,\"downloadReady\":%s,\"sd\":%s,\"p1Reachable\":%s,"
+           "\"p1AgeMs\":%lu,\"p1Ip\":\"%s\",\"inverterListening\":%s,\"bias\":%.2f,"
            "\"averageRaw\":%.1f,\"effectiveGain\":%.3f,\"transient\":\"%s\","
            "\"config\":{\"normalGain\":%.3f,\"stepGain\":%.3f,\"brakeGain\":%.3f,"
            "\"stepThreshold\":%.0f,\"holdMs\":%lu,\"rampMs\":%lu,\"freezeMs\":%lu,\"targetImport\":%.0f},"
@@ -1524,7 +1593,9 @@ static void handleState() {
            "\"csvFirstUptimeMs\":%lu,\"csvLatestUptimeMs\":%lu}",
            maintenancePaused ? "true" : "false",
            sdPauseAcknowledged ? "true" : "false",
-           sdReady ? "true" : "false", controlBiasW, controlAverageRawW,
+           sdReady ? "true" : "false", p1Reachable ? "true" : "false",
+           (unsigned long)p1Age, getP1Ip().c_str(), inverterListening ? "true" : "false",
+           controlBiasW, controlAverageRawW,
            controlEffectiveGain, transientName,
            config.normalGain, config.stepGain, config.brakeGain, config.stepThresholdW,
            (unsigned long)config.holdMs, (unsigned long)config.rampMs,
@@ -1533,6 +1604,64 @@ static void handleState() {
            sdLogPath.c_str(), (unsigned long)sdWrittenBytes, (unsigned long)sdLoggedRows,
            (unsigned long)sdFirstUptimeMs, (unsigned long)sdLatestUptimeMs);
   server.send(200, "application/json", state);
+}
+
+static void handleStartLogging() {
+  if (!checkAuth()) return;
+  if (sdReady) {
+    server.send(200, "text/plain", "CSV logging is already active");
+    return;
+  }
+
+  xSemaphoreTake(sdMutex, portMAX_DELAY);
+  SD.end();
+  const bool cardReady = SD.begin(SD_CS_PIN, sdSpi, SD_SPI_HZ);
+  if (!cardReady || SD.cardType() == CARD_NONE) {
+    xSemaphoreGive(sdMutex);
+    server.send(503, "text/plain", "No SD card detected. Insert a FAT32 card and try again.");
+    return;
+  }
+
+  sdLogPath = "";
+  for (int index = 0; index < 1000; index++) {
+    char path[16];
+    snprintf(path, sizeof(path), "/p1gw%03d.csv", index);
+    if (!SD.exists(path)) { sdLogPath = path; break; }
+  }
+  if (sdLogPath.isEmpty()) {
+    xSemaphoreGive(sdMutex);
+    server.send(507, "text/plain", "No free CSV filename is available on the SD card");
+    return;
+  }
+
+  sdLogFile = SD.open(sdLogPath, FILE_WRITE);
+  if (!sdLogFile) {
+    xSemaphoreGive(sdMutex);
+    server.send(500, "text/plain", "SD card detected, but the CSV file could not be created");
+    return;
+  }
+  sdWrittenBytes = sdLogFile.println(
+    "uptime_ms,wall_time,p1_raw_l1_w,p1_raw_l2_w,p1_raw_l3_w,p1_raw_total_w,"
+    "p1_raw_l1_a,p1_raw_l2_a,p1_raw_l3_a,p1_l1_v,p1_l2_v,p1_l3_v,"
+    "meter_l1_w,meter_l2_w,meter_l3_w,meter_total_w,meter_l1_a,meter_l2_a,meter_l3_a,"
+    "inv_active_l1_w,inv_active_l2_w,inv_active_l3_w,inv_active_total_w,"
+    "inv_meter_l1_w,inv_meter_l2_w,inv_meter_l3_w,inv_meter_total_w,inv_comm_status,"
+    "inv_grid_w,backup_l1_w,backup_l2_w,backup_l3_w,backup_total_w,"
+    "load_l1_w,load_l2_w,load_l3_w,load_total_w,inv_age_ms,run_age_ms,inv_valid,run_valid,dropped_rows,"
+    "control_average_raw_w,control_bias_w,control_held,rs485_age_ms,active_meter_address,"
+    "pv1_w,pv2_w,pv3_w,pv4_w,pv_total_w,inverter_ac_w,battery_w,"
+    "effective_feedback_gain,transient_state,normal_gain,step_gain,brake_gain,step_threshold_w,"
+    "hold_ms,ramp_ms,integral_freeze_ms,target_import_w,average_tau_ms,integral_time_ms,bias_limit_w,phase_rotation");
+  sdLogFile.flush();
+  sdDroppedRows = 0;
+  sdLoggedRows = 0;
+  sdFirstUptimeMs = 0;
+  sdLatestUptimeMs = 0;
+  xQueueReset(sdLogQueue);
+  sdReady = true;
+  xSemaphoreGive(sdMutex);
+  logPrintf("SD logging started: %s\n", sdLogPath.c_str());
+  server.send(200, "text/plain", "CSV logging started: " + sdLogPath);
 }
 
 static bool normalizeLogFilename(String &name) {
@@ -1661,39 +1790,6 @@ static void handleSdLog() {
 
 // ───────────────────────── TASKS ─────────────────────────────────
 static void sdLogTask(void *) {
-  sdSpi.begin(SD_SCLK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
-  if (SD.begin(SD_CS_PIN, sdSpi, SD_SPI_HZ)) {
-    for (int index = 0; index < 1000; index++) {
-      char path[16];
-      snprintf(path, sizeof(path), "/p1gw%03d.csv", index);
-      if (!SD.exists(path)) { sdLogPath = path; break; }
-    }
-    if (!sdLogPath.isEmpty()) {
-      sdLogFile = SD.open(sdLogPath, FILE_WRITE);
-      if (sdLogFile) {
-        sdWrittenBytes = sdLogFile.println(
-          "uptime_ms,wall_time,p1_raw_l1_w,p1_raw_l2_w,p1_raw_l3_w,p1_raw_total_w,"
-          "p1_raw_l1_a,p1_raw_l2_a,p1_raw_l3_a,p1_l1_v,p1_l2_v,p1_l3_v,"
-          "meter_l1_w,meter_l2_w,meter_l3_w,meter_total_w,meter_l1_a,meter_l2_a,meter_l3_a,"
-          "inv_active_l1_w,inv_active_l2_w,inv_active_l3_w,inv_active_total_w,"
-          "inv_meter_l1_w,inv_meter_l2_w,inv_meter_l3_w,inv_meter_total_w,inv_comm_status,"
-          "inv_grid_w,backup_l1_w,backup_l2_w,backup_l3_w,backup_total_w,"
-          "load_l1_w,load_l2_w,load_l3_w,load_total_w,inv_age_ms,run_age_ms,inv_valid,run_valid,dropped_rows,"
-          "control_average_raw_w,control_bias_w,control_held,rs485_age_ms,active_meter_address,"
-          "pv1_w,pv2_w,pv3_w,pv4_w,pv_total_w,inverter_ac_w,battery_w,"
-          "effective_feedback_gain,transient_state,normal_gain,step_gain,brake_gain,step_threshold_w,"
-          "hold_ms,ramp_ms,integral_freeze_ms,target_import_w,average_tau_ms,integral_time_ms,bias_limit_w,phase_rotation");
-        sdLogFile.flush();
-        sdReady = true;
-        logPrintf("SD logging: %s\n", sdLogPath.c_str());
-      }
-    }
-  }
-  if (!sdReady) {
-    logPrintln("SD logging unavailable (insert a FAT32 card and reboot). ");
-    vTaskDelete(nullptr);
-  }
-
   char *batch = (char *)malloc(SD_BATCH_SIZE);
   if (!batch) {
     sdReady = false;
@@ -1705,6 +1801,11 @@ static void sdLogTask(void *) {
   size_t batchLen = 0;
   uint32_t lastFlush = millis();
   for (;;) {
+    if (!sdReady) {
+      batchLen = 0;
+      vTaskDelay(pdMS_TO_TICKS(200));
+      continue;
+    }
     if (maintenancePaused) {
       if (!sdPauseAcknowledged) {
         xSemaphoreTake(sdMutex, portMAX_DELAY);
@@ -1731,8 +1832,10 @@ static void sdLogTask(void *) {
       if (!sdLogFile) {
         sdReady = false;
         logPrintln("SD logging stopped: could not reopen log after maintenance.");
-        free(batch);
-        vTaskDelete(nullptr);
+        sdPauseAcknowledged = false;
+        batchLen = 0;
+        xQueueReset(sdLogQueue);
+        continue;
       }
       sdPauseAcknowledged = false;
       lastFlush = millis();
@@ -1790,8 +1893,9 @@ static void sdLogTask(void *) {
           if (written != batchLen) {
             sdReady = false;
             logPrintln("SD logging stopped: card write failed.");
-            free(batch);
-            vTaskDelete(nullptr);
+            batchLen = 0;
+            xQueueReset(sdLogQueue);
+            continue;
           }
           batchLen = 0;
           lastFlush = millis();
@@ -1812,8 +1916,9 @@ static void sdLogTask(void *) {
       if (written != batchLen) {
         sdReady = false;
         logPrintln("SD logging stopped: card write failed.");
-        free(batch);
-        vTaskDelete(nullptr);
+        batchLen = 0;
+        xQueueReset(sdLogQueue);
+        continue;
       }
       batchLen = 0;
       lastFlush = millis();
@@ -1890,7 +1995,9 @@ void setup() {
 
   statusLed.begin();
   statusLed.setBrightness(60);
-  statusLed.show();               // off until the first P1 poll completes
+  statusLed.clear();
+  statusLed.show();
+  xTaskCreatePinnedToCore(ledTask, "led", 2048, nullptr, 1, nullptr, 0);
 
   meterMutex = xSemaphoreCreateMutex();
   ipMutex     = xSemaphoreCreateMutex();
@@ -1898,9 +2005,21 @@ void setup() {
   sdMutex     = xSemaphoreCreateMutex();
   controlMutex = xSemaphoreCreateMutex();
   sdLogQueue  = xQueueCreate(SD_LOG_QUEUE_LEN, sizeof(SdLogSample));
+  sdSpi.begin(SD_SCLK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
   prefs.begin("p1cfg", false);
   p1Ip = prefs.getString("p1ip", P1_IP_DEFAULT);
-  controlConfig.normalGain = constrain(prefs.getFloat("normGain", CONTROL_FEEDBACK_GAIN), 0.0f, CONTROL_FEEDBACK_GAIN);
+  if (prefs.getUChar("ctrlVer", 0) < CONTROL_CONFIG_VERSION) {
+    prefs.putFloat("normGain", CONTROL_FEEDBACK_GAIN);
+    prefs.putFloat("stepGain", CONTROL_DEFAULT_STEP_GAIN);
+    prefs.putFloat("brakeGain", CONTROL_DEFAULT_BRAKE_GAIN);
+    prefs.putFloat("stepW", CONTROL_STEP_FREEZE_W);
+    prefs.putFloat("targetW", CONTROL_TARGET_IMPORT_W);
+    prefs.putULong("holdMs", CONTROL_DEFAULT_HOLD_MS);
+    prefs.putULong("rampMs", CONTROL_DEFAULT_RAMP_MS);
+    prefs.putULong("freezeMs", CONTROL_STEP_FREEZE_MS);
+    prefs.putUChar("ctrlVer", CONTROL_CONFIG_VERSION);
+  }
+  controlConfig.normalGain = constrain(prefs.getFloat("normGain", CONTROL_FEEDBACK_GAIN), 0.0f, CONTROL_NORMAL_GAIN_MAX);
   controlConfig.stepGain = constrain(prefs.getFloat("stepGain", CONTROL_DEFAULT_STEP_GAIN), 0.0f, CONTROL_FEEDBACK_GAIN);
   controlConfig.brakeGain = constrain(prefs.getFloat("brakeGain", CONTROL_DEFAULT_BRAKE_GAIN), 0.0f, CONTROL_FEEDBACK_GAIN);
   controlConfig.stepThresholdW = constrain(prefs.getFloat("stepW", CONTROL_STEP_FREEZE_W), 50.0f, 5000.0f);
@@ -1925,11 +2044,12 @@ void setup() {
              : "\nWiFi not connected (will retry).");
   configTzTime(TIME_ZONE, "pool.ntp.org", "time.nist.gov");
 
-  if (MDNS.begin("p1meter")) {
-    logPrintln("Config page: http://p1meter.local/");
+  if (MDNS.begin("gmk330emulator")) {
+    logPrintln("Config page: http://GMK330emulator.local/");
   }
   server.on("/",      HTTP_GET,  handleRoot);
   server.on("/save",  HTTP_POST, handleSave);
+  server.on("/p1ip", HTTP_POST, handleP1Ip);
   server.on("/reset", HTTP_POST, handleReset);
   server.on("/control", HTTP_POST, handleControl);
   server.on("/pause", HTTP_POST, handlePause);
@@ -1940,6 +2060,7 @@ void setup() {
   server.on("/invraw", HTTP_GET, handleInvRaw);
   server.on("/logs", HTTP_GET, handleLogs);
   server.on("/sdlog", HTTP_GET, handleSdLog);
+  server.on("/logging/start", HTTP_POST, handleStartLogging);
   server.begin();
 
   // P1 polling and inverter Modbus TCP polling on core 0, Modbus responder on core 1.
