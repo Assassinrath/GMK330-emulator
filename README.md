@@ -54,6 +54,27 @@ build runs `scripts/embed_web.py`, compresses the page with gzip, and embeds it
 in the firmware. No filesystem image or separate web-interface upload is needed.
 Edit the HTML file and run the usual build/upload commands to deploy UI changes.
 
+### Firmware updates over Wi-Fi
+
+The firmware uses two application partitions so updates can be uploaded from the
+dashboard. Because installing this partition layout rewrites the flash partition
+table, deploy the OTA-enabled firmware once over USB with the normal PlatformIO
+upload command. Existing settings remain in the unchanged NVS partition, but the
+GoodWe `Meter1` external-meter setting must still be reapplied after the restart.
+
+For later updates:
+
+1. Build with `pio run -e lilygo-t-can485`.
+2. Open **Firmware update** on the dashboard.
+3. Select `.pio/build/lilygo-t-can485/firmware.bin` and install it.
+
+Do not select `firmware.factory.bin` for a dashboard update. Meter responses,
+P1 polling, inverter diagnostics, and SD logging pause while the image is being
+written and resume only if the update fails. A validated image restarts the
+controller automatically. The upload endpoint uses the dashboard credentials,
+but HTTP does not encrypt them or the firmware; perform updates only on a trusted
+local network.
+
 ## Operation
 
 After startup, open `http://GMK330emulator.local/` or the board's DHCP address and log

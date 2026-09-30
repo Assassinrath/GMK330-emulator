@@ -32,6 +32,11 @@
         font-size: 1.8rem;
         margin: 0 0 6px;
       }
+      .firmware-version {
+        margin: 0 0 8px;
+        color: var(--muted);
+        font: 13px monospace;
+      }
       .status {
         display: flex;
         flex-wrap: wrap;
@@ -338,6 +343,9 @@
         height: 18px;
         margin: 0;
       }
+      .ota-editor input[type="file"] {
+        max-width: min(100%, 360px);
+      }
       .status-grid {
         display: grid;
         grid-template-columns: repeat(3, 1fr);
@@ -411,6 +419,9 @@
   <body>
     <header>
       <h1>Grid Meter (P1) to GoodWe control</h1>
+      <p id="firmwareVersion" class="firmware-version">
+        Firmware version: checking
+      </p>
       <div id="status" class="status">
         <span class="indicator"
           ><i id="p1Dot" class="dot"></i
@@ -684,6 +695,7 @@
         ><button onclick="toggleIp()">Change Grid Meter (P1) IP</button
         ><button onclick="toggleInverterConfig()">
           Configure Inverter Modbus</button
+        ><button onclick="toggleOta()">Firmware update</button
         ><a class="action" href="/logs">CSV logs</a>
       </div>
       <div id="ipEditor" class="ip-editor">
@@ -702,6 +714,16 @@
           inputmode="decimal"
           aria-label="Inverter Modbus TCP IP address"
         /><button onclick="saveInverterConfig()">Save inverter</button>
+      </div>
+      <div id="otaEditor" class="ip-editor config-editor ota-editor">
+        <input
+          id="firmwareFile"
+          type="file"
+          accept=".bin,application/octet-stream"
+          aria-label="Firmware binary"
+        /><button id="otaButton" onclick="uploadFirmware()">
+          Install firmware
+        </button>
       </div>
       <div id="utilityMessage"></div>
       <p class="links">
@@ -748,12 +770,16 @@
         loaded = false,
         currentP1Ip = "",
         currentInverterIp = "",
-        inverterModbusEnabled = true;
+        inverterModbusEnabled = true,
+        otaUploading = false;
       async function state() {
+        if (otaUploading) return;
         try {
           const r = await fetch("/state"),
             j = await r.json();
           paused = j.paused;
+          document.getElementById("firmwareVersion").textContent =
+            "Firmware v" + j.firmwareVersion;
           const pd = document.getElementById("p1Dot"),
             id = document.getElementById("invDot"),
             md = document.getElementById("modbusDot");
@@ -905,6 +931,61 @@
           inverterStatus();
         }
       }
+      function toggleOta() {
+        const editor = document.getElementById("otaEditor"),
+          opening = !editor.classList.contains("open");
+        editor.classList.toggle("open");
+        if (opening) document.getElementById("firmwareFile").focus();
+      }
+      function uploadFirmware() {
+        const input = document.getElementById("firmwareFile"),
+          button = document.getElementById("otaButton"),
+          message = document.getElementById("utilityMessage"),
+          file = input.files[0];
+        if (!file) {
+          message.textContent = "Select a firmware .bin file";
+          return;
+        }
+        if (
+          !confirm(
+            "Install this firmware? Meter responses stop during upload and the controller restarts after validation.",
+          )
+        )
+          return;
+
+        otaUploading = true;
+        button.disabled = true;
+        input.disabled = true;
+        message.textContent = "Uploading firmware: 0%";
+        const body = new FormData();
+        body.append("firmware", file, file.name);
+        const request = new XMLHttpRequest();
+        request.open("POST", "/update");
+        request.upload.onprogress = (event) => {
+          if (event.lengthComputable)
+            message.textContent =
+              "Uploading firmware: " +
+              Math.round((event.loaded * 100) / event.total) +
+              "%";
+        };
+        request.onload = () => {
+          message.textContent = request.responseText || "Firmware update failed";
+          if (request.status < 200 || request.status >= 300) {
+            otaUploading = false;
+            button.disabled = false;
+            input.disabled = false;
+            state();
+          }
+        };
+        request.onerror = () => {
+          message.textContent = "Firmware upload connection failed";
+          otaUploading = false;
+          button.disabled = false;
+          input.disabled = false;
+          state();
+        };
+        request.send(body);
+      }
       async function startLogging() {
         const m = document.getElementById("utilityMessage"),
           b = document.getElementById("logButton");
@@ -971,6 +1052,7 @@
           );
       }
       async function sample() {
+        if (otaUploading) return;
         try {
           const r = await fetch("/data"),
             j = await r.json(),
@@ -991,6 +1073,7 @@
             : (value / 1000).toFixed(1) + " s ago";
       }
       async function inverterStatus() {
+        if (otaUploading) return;
         try {
           const response = await fetch("/inverter/status"),
             status = await response.json(),

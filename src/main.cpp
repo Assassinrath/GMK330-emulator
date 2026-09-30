@@ -25,6 +25,7 @@
 #include <ArduinoJson.h>
 #include <Adafruit_NeoPixel.h>
 #include <WebServer.h>
+#include <Update.h>
 #include <Preferences.h>
 #include <ESPmDNS.h>
 #include <SPI.h>
@@ -35,6 +36,8 @@
 #include "web_index.h"
 
 // ───────────────────────── USER SETTINGS ─────────────────────────
+#define FIRMWARE_VERSION "1.0.1"
+
 // Default P1 IP, used only until a value is saved via the web config page.
 #define P1_IP_DEFAULT    "192.168.1.252"
 
@@ -57,7 +60,6 @@
 #define P1_POLL_MS       500
 #define P1_HTTP_TIMEOUT  700          // must be < P1_POLL_MS
 #define P1_MAX_FAILS     4            // stop answering inverter after N fails
-#define P1_REBOOT_FAILS  120          // hard reboot after N fails (~60 s)
 
 // The GMK330 0x0501 block stores energy in 0.01 kWh increments. Persist at a
 // low rate to retain totals without adding significant flash wear.
@@ -307,6 +309,12 @@ static volatile uint32_t sdFirstUptimeMs = 0;
 static volatile uint32_t sdLatestUptimeMs = 0;
 static volatile bool maintenancePaused = false;
 static volatile bool sdPauseAcknowledged = false;
+static bool otaUploadAuthorized = false;
+static bool otaUploadFailed = false;
+static bool otaUploadComplete = false;
+static bool otaResumeAfterFailure = false;
+static String otaError;
+static uint32_t otaRestartAtMs = 0;
 
 struct ControlConfig {
   float normalGain;
@@ -1241,6 +1249,71 @@ static bool checkAuth() {
   return true;
 }
 
+static void failOtaUpload(const String &message) {
+  otaUploadFailed = true;
+  otaError = message;
+  logPrintln("[OTA] " + message);
+}
+
+static void handleOtaUpload() {
+  HTTPUpload &upload = server.upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    otaUploadAuthorized = server.authenticate(CONFIG_USER, CONFIG_PASS);
+    otaUploadFailed = false;
+    otaUploadComplete = false;
+    otaError = "";
+    if (!otaUploadAuthorized) return;
+
+    otaResumeAfterFailure = !maintenancePaused;
+    maintenancePaused = true;
+    const uint32_t pauseStartedMs = millis();
+    while (sdReady && !sdPauseAcknowledged && millis() - pauseStartedMs < 5000UL) delay(20);
+    if (sdReady && !sdPauseAcknowledged) {
+      failOtaUpload("Could not pause SD logging");
+      return;
+    }
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+      failOtaUpload("Could not start firmware update (error " + String(Update.getError()) + ")");
+      return;
+    }
+    logPrintf("[OTA] Receiving %s\n", upload.filename.c_str());
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (!otaUploadAuthorized || otaUploadFailed) return;
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      failOtaUpload("Firmware write failed (error " + String(Update.getError()) + ")");
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (!otaUploadAuthorized) return;
+    if (!otaUploadFailed && !Update.end(true)) {
+      failOtaUpload("Firmware validation failed (error " + String(Update.getError()) + ")");
+    } else if (!otaUploadFailed) {
+      otaUploadComplete = true;
+      logPrintf("[OTA] Firmware accepted: %u bytes\n", (unsigned)upload.totalSize);
+    }
+    if (otaUploadFailed) Update.abort();
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    if (!otaUploadAuthorized) return;
+    Update.abort();
+    failOtaUpload("Firmware upload was aborted");
+  }
+}
+
+static void handleOtaComplete() {
+  if (!checkAuth()) return;
+
+  if (!otaUploadAuthorized || !otaUploadComplete || otaUploadFailed || Update.hasError()) {
+    if (otaResumeAfterFailure) maintenancePaused = false;
+    const String message = otaError.length() ? otaError : "Firmware update failed";
+    server.send(500, "text/plain", message);
+    return;
+  }
+
+  server.sendHeader("Connection", "close");
+  server.send(200, "text/plain", "Firmware installed. Restarting controller...");
+  otaRestartAtMs = millis() + 1000UL;
+}
+
 static void handleRoot() {
   if (!checkAuth()) return;
 
@@ -1527,7 +1600,7 @@ static void handleState() {
                               controlTransientState == 3 ? "gain ramp" : "normal";
   char state[1024];
   snprintf(state, sizeof(state),
-           "{\"paused\":%s,\"downloadReady\":%s,\"sd\":%s,\"p1Reachable\":%s,"
+           "{\"firmwareVersion\":\"%s\",\"paused\":%s,\"downloadReady\":%s,\"sd\":%s,\"p1Reachable\":%s,"
            "\"p1AgeMs\":%lu,\"p1Ip\":\"%s\",\"inverterListening\":%s,"
            "\"inverterModbusEnabled\":%s,\"inverterModbusOk\":%s,"
            "\"inverterModbusAgeMs\":%lu,\"inverterIp\":\"%s\","
@@ -1537,7 +1610,7 @@ static void handleState() {
            "\"rs485AgeMs\":%lu,\"meterAddress\":%u,"
            "\"csv\":\"%s\",\"csvBytes\":%lu,\"csvRows\":%lu,"
            "\"csvFirstUptimeMs\":%lu,\"csvLatestUptimeMs\":%lu}",
-           maintenancePaused ? "true" : "false",
+           FIRMWARE_VERSION, maintenancePaused ? "true" : "false",
            sdPauseAcknowledged ? "true" : "false",
            sdReady ? "true" : "false", p1Reachable ? "true" : "false",
            (unsigned long)p1Age, getP1Ip().c_str(), inverterListening ? "true" : "false",
@@ -1933,13 +2006,6 @@ static void p1Task(void *) {
       continue;
     }
     fetchP1();
-    xSemaphoreTake(meterMutex, portMAX_DELAY);
-    int fails = meter.failCount;
-    xSemaphoreGive(meterMutex);
-    if (fails >= P1_REBOOT_FAILS) {
-      delay(200);
-      ESP.restart();
-    }
     vTaskDelay(pdMS_TO_TICKS(P1_POLL_MS));
   }
 }
@@ -2067,6 +2133,7 @@ void setup() {
   server.on("/logs", HTTP_GET, handleLogs);
   server.on("/sdlog", HTTP_GET, handleSdLog);
   server.on("/logging/start", HTTP_POST, handleStartLogging);
+  server.on("/update", HTTP_POST, handleOtaComplete, handleOtaUpload);
   server.begin();
 
   // P1 polling and inverter Modbus TCP polling on core 0, Modbus responder on core 1.
@@ -2079,6 +2146,10 @@ void setup() {
 
 void loop() {
   server.handleClient();
+  if (otaRestartAtMs && (int32_t)(millis() - otaRestartAtMs) >= 0) {
+    delay(100);
+    ESP.restart();
+  }
   static uint32_t last = 0;
   if (millis() - last > 10000) {
     last = millis();

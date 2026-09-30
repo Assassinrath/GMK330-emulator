@@ -5,4 +5,5 @@
 compile_commands.json
 include/secrets.h
 *.csv
+!partitions_ota.csv
 *.bak
