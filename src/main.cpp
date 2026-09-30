@@ -332,6 +332,10 @@ static bool controlInitialized = false;
 // ───────────────────────── NETWORK CONFIG ────────────────────────
 static Preferences        prefs;
 static SemaphoreHandle_t  ipMutex = nullptr;
+static String             wifiSsid;
+static String             wifiPassword;
+static String             configUser;
+static String             configPassword;
 static String             p1Ip;
 static GridMeterType      gridMeterType = GridMeterType::HomeWizard;
 static volatile uint32_t  gridMeterGeneration = 0;
@@ -1100,7 +1104,7 @@ static void fetchInverterMeter() {
 
 // ───────────────────────── WEB CONFIG ────────────────────────────
 static bool checkAuth() {
-  if (!server.authenticate(CONFIG_USER, CONFIG_PASS)) {
+  if (!server.authenticate(configUser.c_str(), configPassword.c_str())) {
     server.requestAuthentication();
     return false;
   }
@@ -1117,7 +1121,7 @@ static void handleOtaUpload() {
   HTTPUpload &upload = server.upload();
 
   if (upload.status == UPLOAD_FILE_START) {
-    otaUploadAuthorized = server.authenticate(CONFIG_USER, CONFIG_PASS);
+    otaUploadAuthorized = server.authenticate(configUser.c_str(), configPassword.c_str());
     otaUploadFailed = false;
     otaUploadComplete = false;
     otaError = "";
@@ -2006,6 +2010,14 @@ void setup() {
   prefs.begin("p1cfg", false);
   prefs.remove("meterUser");
   prefs.remove("meterPass");
+  if (!prefs.isKey("wifiSsid")) prefs.putString("wifiSsid", WIFI_SSID);
+  if (!prefs.isKey("wifiPass")) prefs.putString("wifiPass", WIFI_PASS);
+  if (!prefs.isKey("webUser")) prefs.putString("webUser", CONFIG_USER);
+  if (!prefs.isKey("webPass")) prefs.putString("webPass", CONFIG_PASS);
+  wifiSsid = prefs.getString("wifiSsid", WIFI_SSID);
+  wifiPassword = prefs.getString("wifiPass", WIFI_PASS);
+  configUser = prefs.getString("webUser", CONFIG_USER);
+  configPassword = prefs.getString("webPass", CONFIG_PASS);
   energyCounters.begin(prefs);
   p1Ip = prefs.getString("p1ip", P1_IP_DEFAULT);
   GridMeterType savedMeterType;
@@ -2038,8 +2050,8 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);                // lower, steadier HTTP latency
   WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  logPrintf("WiFi \"%s\" ", WIFI_SSID);
+  WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
+  logPrintf("WiFi \"%s\" ", wifiSsid.c_str());
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
     delay(400);

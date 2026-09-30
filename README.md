@@ -1,5 +1,7 @@
 # GMK330 emulator
 
+[Download the latest firmware release](https://github.com/GerritPost/GMK330-emulator/releases/latest)
+
 Firmware for a LilyGo T-CAN485 that reads a HomeWizard P1, Shelly 3EM,
 Shelly Pro 3EM, or Shelly EM Mini Gen4 over Wi-Fi and emulates a GoodWe GMK330
 three-phase grid meter over Modbus RTU. It was developed for a GoodWe ET-series
@@ -36,9 +38,14 @@ interface uses MISO 2, MOSI 15, SCLK 14, and CS 13.
 
 `include/secrets.h` is ignored by Git. Do not commit real credentials.
 
-## Build and upload
+## First-time setup and USB installation
 
-Install [PlatformIO](https://platformio.org/), connect the T-CAN485, then run:
+The first installation must be performed over USB. This installs the required
+dual-slot OTA partition layout and a firmware build containing the installation's
+Wi-Fi and dashboard credentials.
+
+Complete the [Configuration](#configuration) steps, install
+[PlatformIO](https://platformio.org/), connect the T-CAN485 over USB, then run:
 
 ```sh
 pio run -e lilygo-t-can485
@@ -49,6 +56,9 @@ pio device monitor -b 115200
 If multiple serial devices are connected, add `--upload-port` to the upload
 command or set a local port in PlatformIO.
 
+After this one-time USB setup, later firmware versions can be installed through
+the dashboard without reconnecting USB, as described below.
+
 ### Web interface development
 
 The dashboard source is [data/index.html](data/index.html). A normal PlatformIO
@@ -58,17 +68,17 @@ Edit the HTML file and run the usual build/upload commands to deploy UI changes.
 
 ### Firmware updates over Wi-Fi
 
-The firmware uses two application partitions so updates can be uploaded from the
-dashboard. Because installing this partition layout rewrites the flash partition
-table, deploy the OTA-enabled firmware once over USB with the normal PlatformIO
-upload command. Existing settings remain in the unchanged NVS partition, but the
+After the first-time USB installation, firmware updates can be uploaded through
+the dashboard. Existing settings remain in the unchanged NVS partition, but the
 GoodWe `Meter1` external-meter setting must still be reapplied after the restart.
 
 For later updates:
 
-1. Build with `pio run -e lilygo-t-can485`.
+1. Download `GMK330Emulator_vX.Y.Z_LilygoT-CAN485.ota.bin` from the latest
+	GitHub Release, or build locally with `pio run -e lilygo-t-can485`.
 2. Open **Firmware update** on the dashboard.
-3. Select `.pio/build/lilygo-t-can485/firmware.bin` and install it.
+3. Select the downloaded `.ota.bin`, or the local
+	`.pio/build/lilygo-t-can485/firmware.bin`, and install it.
 
 Do not select `firmware.factory.bin` for a dashboard update. Meter responses,
 P1 polling, inverter diagnostics, and SD logging pause while the image is being
@@ -76,6 +86,33 @@ written and resume only if the update fails. A validated image restarts the
 controller automatically. The upload endpoint uses the dashboard credentials,
 but HTTP does not encrypt them or the firmware; perform updates only on a trusted
 local network.
+
+### GitHub releases
+
+Version tags automatically create a GitHub Release through
+`.github/workflows/release.yml`. Each release contains:
+
+- `GMK330Emulator_vX.Y.Z_LilygoT-CAN485.ota.bin` for dashboard updates
+- `GMK330Emulator_vX.Y.Z_SHA256SUMS.txt` for download verification
+
+The automated build deliberately uses `include/secrets.example.h`; it never
+contains the maintainer's private credentials. The customized first USB build
+stores the installation's Wi-Fi and dashboard credentials in NVS. Later release
+OTA images reuse those saved credentials instead of their build-time placeholders.
+Do not publish a locally built binary containing real credentials.
+
+To publish a release, update `FIRMWARE_VERSION` in `src/main.cpp`, commit and push
+the finished changes, then create and push a matching tag:
+
+```sh
+git tag v1.0.4
+git push origin v1.0.4
+```
+
+The workflow rejects tags that do not exactly match the source version. Release
+notes are generated automatically from the commits and pull requests since the
+previous tag. The repository must be public if downloads should work without a
+GitHub login.
 
 ## Operation
 
@@ -90,9 +127,10 @@ settings are retained in ESP32 Preferences.
 The grid-meter selector supports:
 
 - **HomeWizard P1** via `/api/v1/data`
-- **Shelly 3EM** via the Gen1 `/status` API
-- **Shelly Pro 3EM** via `/rpc/EM.GetStatus?id=0`
-- **Shelly EM Mini Gen4** via `/rpc/Shelly.GetStatus` and its `pm1:0` component
+- **Shelly 3EM (experimental)** via the Gen1 `/status` API
+- **Shelly Pro 3EM (experimental)** via `/rpc/EM.GetStatus?id=0`
+- **Shelly EM Mini Gen4 (experimental)** via `/rpc/Shelly.GetStatus` and its
+	`pm1:0` component
 
 All sources are normalized to positive import and negative export before entering
 the existing controller. Switching source invalidates the cached reading and the
