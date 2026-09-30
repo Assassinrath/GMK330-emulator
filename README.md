@@ -6,7 +6,7 @@
 
 Firmware for a LilyGo T-CAN485 that reads a HomeWizard P1, Shelly 3EM,
 Shelly Pro 3EM, or Shelly EM Mini Gen4 over Wi-Fi and emulates a GoodWe GMK330
-three-phase grid meter over Modbus RTU. It was developed for a GoodWe ET-series
+three-phase grid meter over Modbus RTU. It was developed for a GoodWe ET-series (Tested on GW15K-ET-20)
 inverter configured with an external meter.
 
 The emulator also provides:
