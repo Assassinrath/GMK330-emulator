@@ -59,6 +59,12 @@
 #define P1_MAX_FAILS     4            // stop answering inverter after N fails
 #define P1_REBOOT_FAILS  120          // hard reboot after N fails (~60 s)
 
+// The GMK330 0x0501 block stores energy in 0.01 kWh increments. Persist at a
+// low rate to retain totals without adding significant flash wear.
+#define ENERGY_RAW_UNIT_WMS       36000000ULL
+#define ENERGY_SAVE_INTERVAL_MS   900000UL
+#define ENERGY_PERSIST_VERSION    1U
+
 // Normal gain may be raised for testing, while transient gains remain bounded.
 #define CONTROL_FEEDBACK_GAIN       0.33f
 #define CONTROL_NORMAL_GAIN_MAX     1.0f
@@ -183,6 +189,23 @@ struct MeterData {
 static MeterData        meter      = {};
 static SemaphoreHandle_t meterMutex = nullptr;
 static volatile uint8_t activeMeterAddress = GMK330_NORMAL_ADDR;
+
+struct EnergyData {
+  uint64_t raw[6];          // export L1-L3, then import L1-L3; x0.01 kWh
+  uint64_t remainderWms[6];
+  uint32_t lastUpdateMs;
+  uint32_t lastSaveMs;
+  bool dirty;
+};
+
+struct PersistedEnergyData {
+  uint32_t version;
+  uint64_t raw[6];
+  uint64_t remainderWms[6];
+};
+
+static EnergyData energy = {};
+static SemaphoreHandle_t energyMutex = nullptr;
 
 // Raw P1 readings (L1/L2/L3, pre-rotation, pre sign-flip) kept only for the /data debug view.
 struct P1Debug {
@@ -327,6 +350,71 @@ static String             p1Ip;
 static String             inverterIp;
 static bool               inverterModbusEnabled = true;
 static WebServer          server(80);
+
+static void loadEnergyCounters() {
+  PersistedEnergyData saved = {};
+  if (prefs.getBytesLength("energy") == sizeof(saved) &&
+      prefs.getBytes("energy", &saved, sizeof(saved)) == sizeof(saved) &&
+      saved.version == ENERGY_PERSIST_VERSION) {
+    for (size_t i = 0; i < 6; i++) {
+      energy.raw[i] = saved.raw[i];
+      energy.remainderWms[i] = saved.remainderWms[i] % ENERGY_RAW_UNIT_WMS;
+    }
+  }
+  energy.lastSaveMs = millis();
+}
+
+static void saveEnergyCountersIfDue(uint32_t nowMs) {
+  if (nowMs - energy.lastSaveMs < ENERGY_SAVE_INTERVAL_MS) return;
+
+  PersistedEnergyData saved = { ENERGY_PERSIST_VERSION, {}, {} };
+  xSemaphoreTake(energyMutex, portMAX_DELAY);
+  const bool dirty = energy.dirty;
+  if (dirty) {
+    memcpy(saved.raw, energy.raw, sizeof(saved.raw));
+    memcpy(saved.remainderWms, energy.remainderWms, sizeof(saved.remainderWms));
+    energy.dirty = false;
+  }
+  energy.lastSaveMs = nowMs;
+  xSemaphoreGive(energyMutex);
+
+  if (dirty && prefs.putBytes("energy", &saved, sizeof(saved)) != sizeof(saved)) {
+    xSemaphoreTake(energyMutex, portMAX_DELAY);
+    energy.dirty = true;
+    xSemaphoreGive(energyMutex);
+  }
+}
+
+static void updateEnergyCounters(float p1W, float p2W, float p3W, uint32_t nowMs) {
+#if PHASE_ROTATION == 1
+  const float phasePowerW[3] = { p2W, p3W, p1W };
+#elif PHASE_ROTATION == 2
+  const float phasePowerW[3] = { p3W, p1W, p2W };
+#else
+  const float phasePowerW[3] = { p1W, p2W, p3W };
+#endif
+
+  xSemaphoreTake(energyMutex, portMAX_DELAY);
+  if (energy.lastUpdateMs != 0) {
+    const uint32_t elapsedMs = nowMs - energy.lastUpdateMs;
+    if (elapsedMs <= 2000UL) {
+      for (size_t phase = 0; phase < 3; phase++) {
+        const float powerW = phasePowerW[phase];
+        if (powerW == 0.0f) continue;
+        const size_t slot = powerW < 0.0f ? phase : phase + 3;
+        const uint64_t deltaWms = (uint64_t)(fabsf(powerW) * elapsedMs + 0.5f);
+        energy.remainderWms[slot] += deltaWms;
+        energy.raw[slot] += energy.remainderWms[slot] / ENERGY_RAW_UNIT_WMS;
+        energy.remainderWms[slot] %= ENERGY_RAW_UNIT_WMS;
+        energy.dirty = true;
+      }
+    }
+  }
+  energy.lastUpdateMs = nowMs;
+  xSemaphoreGive(energyMutex);
+
+  saveEnergyCountersIfDue(nowMs);
+}
 
 // ───────────────────────── SERIAL LOG BUFFER ─────────────────────
 // Mirrors everything printed to USB serial into a RAM ring buffer so the
@@ -501,6 +589,11 @@ static void sendReadResponse(uint8_t addr, uint8_t fc, uint16_t start, uint16_t 
   MeterData  snap = meter;
   xSemaphoreGive(meterMutex);
 
+  uint64_t energyRaw[8] = {};
+  xSemaphoreTake(energyMutex, portMAX_DELAY);
+  memcpy(energyRaw, energy.raw, sizeof(energy.raw));
+  xSemaphoreGive(energyMutex);
+
   if (!ok) return;                     // safety hold: let the inverter time out
 
   if (count == 0 || count > 125) {
@@ -517,14 +610,17 @@ static void sendReadResponse(uint8_t addr, uint8_t fc, uint16_t start, uint16_t 
   buf[idx++] = (uint8_t)(count * 2);
   for (uint16_t i = 0; i < count; i++) {
     const uint16_t addr = start + i;
-    // The genuine 0x0501 block is populated, but its field semantics are not
-    // decoded yet. Mirror live GMK330 values instead of returning an invalid
-    // one-word frequency block followed by zeros.
-    uint16_t val = (addr >= 0x0501 && addr <= 0x0520)
-                     ? translateReg(snap, 0x0132 + (addr - 0x0501) % 38)
-                     : (addr >= 0x0132 && addr <= 0x0157)
-                       ? translateReg(snap, addr)
-                       : discoveryReg(addr);
+    uint16_t val;
+    if (addr >= 0x0501 && addr <= 0x0520) {
+      const uint16_t offset = addr - 0x0501;
+      const uint8_t slot = offset / 4;
+      const uint8_t word = offset % 4;
+      val = (uint16_t)(energyRaw[slot] >> ((3 - word) * 16));
+    } else if (addr >= 0x0132 && addr <= 0x0157) {
+      val = translateReg(snap, addr);
+    } else {
+      val = discoveryReg(addr);
+    }
     buf[idx++] = (val >> 8) & 0xFF;
     buf[idx++] =  val       & 0xFF;
   }
@@ -773,6 +869,7 @@ static void fetchP1() {
   float p1raw = p1, p2raw = p2, p3raw = p3;   // pre-negation, for the /data debug view
 
   const uint32_t nowMs = millis();
+  updateEnergyCounters(p1raw, p2raw, p3raw, nowMs);
   const float rawTotalW = p1raw + p2raw + p3raw;
   const ControlConfig config = getControlConfig();
   uint32_t controlDtMs = controlLastUpdateMs ? nowMs - controlLastUpdateMs : P1_POLL_MS;
@@ -1903,6 +2000,7 @@ void setup() {
   xTaskCreatePinnedToCore(ledTask, "led", 2048, nullptr, 1, nullptr, 0);
 
   meterMutex = xSemaphoreCreateMutex();
+  energyMutex = xSemaphoreCreateMutex();
   ipMutex     = xSemaphoreCreateMutex();
   invMutex    = xSemaphoreCreateMutex();
   sdMutex     = xSemaphoreCreateMutex();
@@ -1910,6 +2008,7 @@ void setup() {
   sdLogQueue  = xQueueCreate(SD_LOG_QUEUE_LEN, sizeof(SdLogSample));
   sdSpi.begin(SD_SCLK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
   prefs.begin("p1cfg", false);
+  loadEnergyCounters();
   p1Ip = prefs.getString("p1ip", P1_IP_DEFAULT);
   inverterIp = prefs.getString("invip", INVERTER_IP_DEFAULT);
   inverterModbusEnabled = prefs.getBool("inven", true);

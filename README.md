@@ -70,6 +70,12 @@ load readings when the connection is available. Battery status is decoded from
 the inverter's mode register and reports Charging, Discharging, Standby, Waiting
 to charge, or No battery together with the current power magnitude.
 
+The GMK330 cumulative-energy block is calculated from the raw P1 phase powers
+and retained in ESP32 Preferences. New installations start at zero and preserve
+their accumulated import/export values across restarts. Values are saved every
+15 minutes to limit flash wear. Two unidentified auxiliary counters in the
+captured GMK330 block are returned as zero.
+
 > **Important:** After every LilyGo reboot or power cycle, activate `Meter1` and
 > set it to `External` again in the GoodWe configuration. The inverter will not
 > poll the emulator until this setting is reapplied.
