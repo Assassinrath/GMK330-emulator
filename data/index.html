@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>Grid Meter (P1) GoodWe Control</title>
+    <title>Grid Meter to GoodWe Control</title>
     <style>
       :root {
         --ink: #172126;
@@ -30,12 +30,13 @@
       }
       h1 {
         font-size: 1.8rem;
-        margin: 0 0 6px;
+        margin: 0;
       }
       .firmware-version {
-        margin: 0 0 8px;
+        display: block;
+        margin: 2px 0 10px;
         color: var(--muted);
-        font: 13px monospace;
+        font: 11px monospace;
       }
       .status {
         display: flex;
@@ -286,7 +287,10 @@
         cursor: default;
       }
       #message,
-      #utilityMessage {
+      #utilityMessage,
+      #settingsMessage,
+      #meterTestMessage,
+      #otaMessage {
         min-height: 1.3em;
         color: var(--accent);
         font-weight: bold;
@@ -346,6 +350,41 @@
       .ota-editor input[type="file"] {
         max-width: min(100%, 360px);
       }
+      .settings-editor {
+        width: 100%;
+        align-items: stretch;
+        gap: 16px;
+      }
+      .settings-group {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+        width: 100%;
+        padding-top: 14px;
+        border-top: 1px solid var(--line);
+      }
+      .settings-group:first-child {
+        padding-top: 0;
+        border-top: 0;
+      }
+      .settings-group h3,
+      .settings-group .settings-actions,
+      .settings-group .wide {
+        grid-column: 1 / -1;
+      }
+      .settings-group h3 {
+        margin: 0;
+      }
+      .settings-group input,
+      .settings-group select {
+        width: 100%;
+        max-width: none;
+      }
+      .settings-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
       .status-grid {
         display: grid;
         grid-template-columns: repeat(3, 1fr);
@@ -392,6 +431,9 @@
         .grid {
           grid-template-columns: 1fr;
         }
+        .settings-group {
+          grid-template-columns: minmax(0, 1fr);
+        }
         label {
           grid-template-columns: 1fr 96px;
         }
@@ -418,14 +460,12 @@
   </head>
   <body>
     <header>
-      <h1>Grid Meter (P1) to GoodWe control</h1>
-      <p id="firmwareVersion" class="firmware-version">
-        Firmware version: checking
-      </p>
+      <h1>Grid meter to GoodWe control</h1>
+      <small id="firmwareVersion" class="firmware-version">Firmware: checking</small>
       <div id="status" class="status">
         <span class="indicator"
           ><i id="p1Dot" class="dot"></i
-          ><span id="p1Status">Grid Meter (P1): checking</span></span
+          ><span id="p1Status">Grid meter: checking</span></span
         ><span class="indicator"
           ><i id="invDot" class="dot"></i
           ><span id="invStatus">Inverter listening: checking</span
@@ -690,46 +730,59 @@
     <section>
       <div class="utility">
         <button id="toggle" class="stop" onclick="toggle()">Stop polling</button
-        ><button id="logButton" onclick="startLogging()">
-          Start CSV logging</button
-        ><button onclick="toggleIp()">Change Grid Meter (P1) IP</button
-        ><button onclick="toggleInverterConfig()">
-          Configure Inverter Modbus</button
-        ><button onclick="toggleOta()">Firmware update</button
-        ><a class="action" href="/logs">CSV logs</a>
+        ><button onclick="toggleSettings()">Configure settings</button
+        ><button onclick="toggleFirmware()">Firmware update</button
+        ><button onclick="toggleDebug()">Debug menu</button>
       </div>
-      <div id="ipEditor" class="ip-editor">
-        <input
-          id="p1Ip"
-          inputmode="decimal"
-          aria-label="Grid Meter (P1) IP address"
-        /><button onclick="saveIp()">Save IP</button>
+      <div id="settingsEditor" class="ip-editor config-editor settings-editor">
+        <div class="settings-group">
+          <h3>Grid meter</h3>
+          <label>Meter type<select id="meterType">
+            <option value="homewizard">HomeWizard P1</option>
+            <option value="shelly3em">Shelly 3EM</option>
+            <option value="shellypro3em">Shelly Pro 3EM</option>
+            <option value="shellyemminigen4">Shelly EM Mini Gen4</option>
+          </select></label>
+          <label>IP address<input id="meterIp" inputmode="decimal" /></label>
+          <p id="meterTypeNote" class="status-note wide"></p>
+          <div class="settings-actions">
+            <button onclick="testGridMeter()">Test connection</button>
+            <span id="meterTestMessage"></span>
+          </div>
+        </div>
+        <div class="settings-group">
+          <h3>Inverter diagnostics</h3>
+          <label><input id="inverterEnabled" type="checkbox" /> Enable Modbus TCP</label>
+          <label>IP address<input id="inverterIp" inputmode="decimal" /></label>
+        </div>
+        <div class="settings-actions">
+          <button onclick="saveSettings()">Save settings</button>
+        </div>
+        <div id="settingsMessage"></div>
       </div>
-      <div id="inverterEditor" class="ip-editor config-editor">
-        <label
-          ><input id="inverterEnabled" type="checkbox" /> Enable Modbus
-          TCP</label
-        ><input
-          id="inverterIp"
-          inputmode="decimal"
-          aria-label="Inverter Modbus TCP IP address"
-        /><button onclick="saveInverterConfig()">Save inverter</button>
+      <div id="firmwareEditor" class="ip-editor config-editor settings-editor">
+        <div class="settings-group ota-editor">
+          <h3>Firmware update</h3>
+          <input class="wide" id="firmwareFile" type="file" accept=".bin,application/octet-stream" aria-label="Firmware binary" />
+          <div class="settings-actions">
+            <button id="otaButton" onclick="uploadFirmware()">Install firmware</button>
+          </div>
+          <div id="otaMessage" class="wide"></div>
+        </div>
       </div>
-      <div id="otaEditor" class="ip-editor config-editor ota-editor">
-        <input
-          id="firmwareFile"
-          type="file"
-          accept=".bin,application/octet-stream"
-          aria-label="Firmware binary"
-        /><button id="otaButton" onclick="uploadFirmware()">
-          Install firmware
-        </button>
+      <div id="debugEditor" class="ip-editor config-editor settings-editor">
+        <div class="settings-group">
+          <h3>Debug</h3>
+          <div class="settings-actions">
+            <button id="logButton" onclick="startLogging()">Start CSV logging</button>
+            <a class="action" href="/logs">CSV logs</a>
+            <a class="action" href="/data">Live JSON</a>
+            <a class="action" href="/log">Serial log</a>
+            <a class="action" href="/invraw">Raw registers</a>
+          </div>
+          <div id="utilityMessage" class="wide"></div>
+        </div>
       </div>
-      <div id="utilityMessage"></div>
-      <p class="links">
-        <a href="/data">Live JSON</a><a href="/log">Serial log</a
-        ><a href="/invraw">Raw registers</a>
-      </p>
     </section>
     <section>
       <h2>Inverter Modbus TCP status</h2>
@@ -769,6 +822,7 @@
       let paused = false,
         loaded = false,
         currentP1Ip = "",
+        currentMeterType = "homewizard",
         currentInverterIp = "",
         inverterModbusEnabled = true,
         otaUploading = false;
@@ -778,8 +832,6 @@
           const r = await fetch("/state"),
             j = await r.json();
           paused = j.paused;
-          document.getElementById("firmwareVersion").textContent =
-            "Firmware v" + j.firmwareVersion;
           const pd = document.getElementById("p1Dot"),
             id = document.getElementById("invDot"),
             md = document.getElementById("modbusDot");
@@ -794,7 +846,7 @@
                 ? "modbus-ok"
                 : "modbus-bad");
           document.getElementById("p1Status").textContent =
-            "Grid Meter (P1): " + (j.p1Reachable ? "RUNNING" : "UNREACHABLE");
+            j.gridMeterName + ": " + (j.p1Reachable ? "RUNNING" : "UNREACHABLE");
           document.getElementById("invStatus").textContent =
             "Inverter listening: " + (j.inverterListening ? "YES" : "NO");
           document.getElementById("invHelp").hidden = j.inverterListening;
@@ -814,23 +866,26 @@
             " | bias " +
             j.bias.toFixed(1) +
             " W";
+          document.getElementById("firmwareVersion").textContent =
+            "Firmware " + j.firmwareVersion;
           const b = document.getElementById("toggle");
           b.textContent = paused ? "Start polling" : "Stop polling";
           b.className = paused ? "" : "stop";
           const lb = document.getElementById("logButton"),
-            ie = document.getElementById("ipEditor");
+            settingsEditor = document.getElementById("settingsEditor");
           lb.textContent = j.sd ? "CSV logging active" : "Start CSV logging";
           lb.disabled = j.sd;
           currentP1Ip = j.p1Ip;
+          currentMeterType = j.gridMeterType;
           currentInverterIp = j.inverterIp;
           inverterModbusEnabled = j.inverterModbusEnabled;
-          if (!ie.classList.contains("open"))
-            document.getElementById("p1Ip").value = currentP1Ip;
-          const inverterEditor = document.getElementById("inverterEditor");
-          if (!inverterEditor.classList.contains("open")) {
+          if (!settingsEditor.classList.contains("open")) {
+            document.getElementById("meterType").value = currentMeterType;
+            document.getElementById("meterIp").value = currentP1Ip;
             document.getElementById("inverterIp").value = currentInverterIp;
             document.getElementById("inverterEnabled").checked =
               inverterModbusEnabled;
+            updateMeterTypeNote();
           }
           if (!loaded) {
             for (const [k, v] of Object.entries(j.config))
@@ -876,71 +931,87 @@
         await fetch(paused ? "/resume" : "/pause", { method: "POST" });
         state();
       }
-      function toggleIp() {
-        const e = document.getElementById("ipEditor"),
-          opening = !e.classList.contains("open");
-        e.classList.toggle("open");
-        if (opening) {
-          document.getElementById("p1Ip").value = currentP1Ip;
-          document.getElementById("p1Ip").focus();
+      function closeOtherEditors(activeEditor) {
+        for (const editor of document.querySelectorAll(".settings-editor")) {
+          if (editor !== activeEditor) editor.classList.remove("open");
         }
       }
-      async function saveIp() {
-        const m = document.getElementById("utilityMessage"),
-          ip = document.getElementById("p1Ip").value;
-        m.textContent = "Saving Grid Meter (P1) IP...";
-        const r = await fetch("/p1ip", {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: new URLSearchParams({ ip }),
-        });
-        m.textContent = await r.text();
-        if (r.ok) {
-          currentP1Ip = ip;
-          document.getElementById("ipEditor").classList.remove("open");
-          state();
-        }
-      }
-      function toggleInverterConfig() {
-        const editor = document.getElementById("inverterEditor"),
+      function toggleSettings() {
+        const editor = document.getElementById("settingsEditor"),
           opening = !editor.classList.contains("open");
-        editor.classList.toggle("open");
+        closeOtherEditors(editor);
+        editor.classList.toggle("open", opening);
+        document.getElementById("settingsMessage").textContent = "";
+        document.getElementById("meterTestMessage").textContent = "";
         if (opening) {
+          document.getElementById("meterType").value = currentMeterType;
+          document.getElementById("meterIp").value = currentP1Ip;
           document.getElementById("inverterIp").value = currentInverterIp;
           document.getElementById("inverterEnabled").checked =
             inverterModbusEnabled;
-          document.getElementById("inverterIp").focus();
+          updateMeterTypeNote();
+          document.getElementById("meterType").focus();
         }
       }
-      async function saveInverterConfig() {
-        const message = document.getElementById("utilityMessage"),
-          ip = document.getElementById("inverterIp").value,
-          enabled = document.getElementById("inverterEnabled").checked;
-        message.textContent = "Saving inverter Modbus settings...";
-        const response = await fetch("/inverter/config", {
+      function toggleFirmware() {
+        const editor = document.getElementById("firmwareEditor"),
+          opening = !editor.classList.contains("open");
+        closeOtherEditors(editor);
+        editor.classList.toggle("open", opening);
+        document.getElementById("otaMessage").textContent = "";
+        if (opening) document.getElementById("firmwareFile").focus();
+      }
+      function toggleDebug() {
+        const editor = document.getElementById("debugEditor"),
+          opening = !editor.classList.contains("open");
+        closeOtherEditors(editor);
+        editor.classList.toggle("open", opening);
+        if (!opening) document.getElementById("utilityMessage").textContent = "";
+      }
+      function updateMeterTypeNote() {
+        const type = document.getElementById("meterType").value,
+          note = document.getElementById("meterTypeNote");
+        note.textContent = type === "shellyemminigen4"
+          ? "Single-phase measurement: use only when this device measures the complete grid total. The total is distributed evenly over three emulated phases."
+          : "The meter API must be reachable without authentication on the local network.";
+      }
+      document.getElementById("meterType").addEventListener("change", updateMeterTypeNote);
+      function settingsBody() {
+        const body = new URLSearchParams({
+          meterType: document.getElementById("meterType").value,
+          meterIp: document.getElementById("meterIp").value,
+          inverterIp: document.getElementById("inverterIp").value,
+          inverterEnabled: document.getElementById("inverterEnabled").checked,
+        });
+        return body;
+      }
+      async function saveSettings() {
+        const message = document.getElementById("settingsMessage"),
+          response = await fetch("/settings", {
           method: "POST",
           headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: new URLSearchParams({ ip, enabled }),
+          body: settingsBody(),
         });
         message.textContent = await response.text();
         if (response.ok) {
-          currentInverterIp = ip;
-          inverterModbusEnabled = enabled;
-          document.getElementById("inverterEditor").classList.remove("open");
+          document.getElementById("settingsEditor").classList.remove("open");
           state();
           inverterStatus();
         }
       }
-      function toggleOta() {
-        const editor = document.getElementById("otaEditor"),
-          opening = !editor.classList.contains("open");
-        editor.classList.toggle("open");
-        if (opening) document.getElementById("firmwareFile").focus();
+      async function testGridMeter() {
+        const message = document.getElementById("meterTestMessage"),
+          response = await fetch("/settings/test-meter", {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: settingsBody(),
+          });
+        message.textContent = await response.text();
       }
       function uploadFirmware() {
         const input = document.getElementById("firmwareFile"),
           button = document.getElementById("otaButton"),
-          message = document.getElementById("utilityMessage"),
+          message = document.getElementById("otaMessage"),
           file = input.files[0];
         if (!file) {
           message.textContent = "Select a firmware .bin file";

@@ -1,8 +1,9 @@
 # GMK330 emulator
 
-Firmware for a LilyGo T-CAN485 that reads a HomeWizard P1 meter over Wi-Fi and
-emulates a GoodWe GMK330 three-phase grid meter over Modbus RTU. It was developed
-for a GoodWe ET-series inverter configured with an external meter.
+Firmware for a LilyGo T-CAN485 that reads a HomeWizard P1, Shelly 3EM,
+Shelly Pro 3EM, or Shelly EM Mini Gen4 over Wi-Fi and emulates a GoodWe GMK330
+three-phase grid meter over Modbus RTU. It was developed for a GoodWe ET-series
+inverter configured with an external meter.
 
 The emulator also provides:
 
@@ -11,12 +12,12 @@ The emulator also provides:
 - Read-only inverter diagnostics over Modbus TCP
 - CSV logging to the onboard microSD card
 - Downloadable current and historical CSV logs
-- A fail-safe that stops meter responses after repeated P1 read failures
+- A fail-safe that stops meter responses after repeated grid-meter read failures
 
 ## Hardware
 
 - LilyGo T-CAN485 (ESP32-WROOM, MAX13487E auto-direction RS485)
-- HomeWizard P1 meter reachable on the same Wi-Fi network
+- HomeWizard P1, Shelly 3EM, or Shelly Pro 3EM reachable on the same Wi-Fi network
 - GoodWe inverter with the external-meter RS485 connection
 - Optional FAT32 microSD card for CSV logging
 
@@ -29,7 +30,8 @@ interface uses MISO 2, MOSI 15, SCLK 14, and CS 13.
 2. Enter the Wi-Fi SSID/password, choose strong web-interface credentials, and
 	enter the 16-character GMK330 identity observed during meter binding.
 3. Review `P1_IP_DEFAULT` and `INVERTER_IP_DEFAULT` near the top of `src/main.cpp`.
-	Both addresses can be changed later from the dashboard.
+	Both addresses and the grid-meter type can be changed later under
+	**Configure settings** on the dashboard.
 4. Review phase rotation and single-phase splitting options for the installation.
 
 `include/secrets.h` is ignored by Git. Do not commit real credentials.
@@ -80,8 +82,29 @@ local network.
 After startup, open `http://GMK330emulator.local/` or the board's DHCP address and log
 in with the configured web credentials. The page exposes hybrid-controller
 settings, current controller state, a rolling grid-power graph, diagnostics,
-pause/resume controls, and CSV downloads. Saved settings are retained in ESP32
-Preferences.
+pause/resume controls, a **Configure settings** panel for the grid meter and
+inverter diagnostics, a separate **Firmware update** panel, and a **Debug menu**
+for CSV logging, log downloads, live JSON, serial logs, and raw registers. Saved
+settings are retained in ESP32 Preferences.
+
+The grid-meter selector supports:
+
+- **HomeWizard P1** via `/api/v1/data`
+- **Shelly 3EM** via the Gen1 `/status` API
+- **Shelly Pro 3EM** via `/rpc/EM.GetStatus?id=0`
+- **Shelly EM Mini Gen4** via `/rpc/Shelly.GetStatus` and its `pm1:0` component
+
+All sources are normalized to positive import and negative export before entering
+the existing controller. Switching source invalidates the cached reading and the
+emulator withholds meter responses until the newly selected source returns valid
+data. It does not automatically fail over to another configured meter. Meter
+APIs must be reachable without authentication; Shelly's optional SHA-256 Digest
+authentication is not implemented.
+
+The EM Mini Gen4 is single-phase. Select it only when that device measures the
+complete grid total; the firmware distributes that total evenly over the three
+emulated phases. One EM Mini installed on only one phase cannot provide an
+accurate three-phase grid total.
 
 P1 acquisition uses adaptive polling. After changed measurements are detected,
 the firmware waits 800 ms and then requests data every 100 ms until the next
@@ -90,8 +113,8 @@ about 100 ms without continuously making ten requests per second. The API has no
 source timestamp, so identical consecutive measurements cannot be recognized as
 a new refresh; probing continues at 100 ms until a value changes.
 
-Inverter Modbus TCP diagnostics are enabled by default. Use **Configure Inverter
-Modbus** to change the inverter IP or disable these read-only diagnostics. This
+Inverter Modbus TCP diagnostics are enabled by default. Use **Configure settings**
+to change the inverter IP or disable these read-only diagnostics. This
 setting does not disable the RS485 meter emulator. The status section at the
 bottom of the dashboard shows the inverter's grid, PV, AC, battery, backup, and
 load readings when the connection is available. Battery status is decoded from

@@ -34,9 +34,13 @@
 #include <time.h>
 #include "secrets.h"
 #include "web_index.h"
+#include "app_types.h"
+#include "control/energy_counters.h"
+#include "gmk330/register_map.h"
+#include "meters/meter_clients.h"
 
 // ───────────────────────── USER SETTINGS ─────────────────────────
-#define FIRMWARE_VERSION "1.0.2"
+#define FIRMWARE_VERSION "1.0.4"
 
 // Default P1 IP, used only until a value is saved via the web config page.
 #define P1_IP_DEFAULT    "192.168.1.252"
@@ -65,10 +69,6 @@
 
 // The GMK330 0x0501 block stores energy in 0.01 kWh increments. Persist at a
 // low rate to retain totals without adding significant flash wear.
-#define ENERGY_RAW_UNIT_WMS       36000000ULL
-#define ENERGY_SAVE_INTERVAL_MS   900000UL
-#define ENERGY_PERSIST_VERSION    1U
-
 // Normal gain may be raised for testing, while transient gains remain bounded.
 #define CONTROL_FEEDBACK_GAIN       0.33f
 #define CONTROL_NORMAL_GAIN_MAX     1.0f
@@ -181,35 +181,11 @@ static void ledTask(void *) {
 }
 
 // ───────────────────────── SHARED METER DATA ─────────────────────
-struct MeterData {
-  uint16_t Va, Vb, Vc;   // x0.1 V
-  uint16_t Ia, Ib, Ic;   // x0.01 A (magnitude)
-  int32_t  Pa, Pb, Pc;   // x1 W, signed (+export / -import)
-  bool     valid;
-  int      failCount;
-  uint32_t lastOkMs;
-};
-
 static MeterData        meter      = {};
 static SemaphoreHandle_t meterMutex = nullptr;
 static volatile uint8_t activeMeterAddress = GMK330_NORMAL_ADDR;
 
-struct EnergyData {
-  uint64_t raw[6];          // export L1-L3, then import L1-L3; x0.01 kWh
-  uint64_t remainderWms[6];
-  uint32_t lastUpdateMs;
-  uint32_t lastSaveMs;
-  bool dirty;
-};
-
-struct PersistedEnergyData {
-  uint32_t version;
-  uint64_t raw[6];
-  uint64_t remainderWms[6];
-};
-
-static EnergyData energy = {};
-static SemaphoreHandle_t energyMutex = nullptr;
+static EnergyCounters energyCounters;
 
 // Raw P1 readings (L1/L2/L3, pre-rotation, pre sign-flip) kept only for the /data debug view.
 struct P1Debug {
@@ -357,74 +333,11 @@ static bool controlInitialized = false;
 static Preferences        prefs;
 static SemaphoreHandle_t  ipMutex = nullptr;
 static String             p1Ip;
+static GridMeterType      gridMeterType = GridMeterType::HomeWizard;
+static volatile uint32_t  gridMeterGeneration = 0;
 static String             inverterIp;
 static bool               inverterModbusEnabled = true;
 static WebServer          server(80);
-
-static void loadEnergyCounters() {
-  PersistedEnergyData saved = {};
-  if (prefs.getBytesLength("energy") == sizeof(saved) &&
-      prefs.getBytes("energy", &saved, sizeof(saved)) == sizeof(saved) &&
-      saved.version == ENERGY_PERSIST_VERSION) {
-    for (size_t i = 0; i < 6; i++) {
-      energy.raw[i] = saved.raw[i];
-      energy.remainderWms[i] = saved.remainderWms[i] % ENERGY_RAW_UNIT_WMS;
-    }
-  }
-  energy.lastSaveMs = millis();
-}
-
-static void saveEnergyCountersIfDue(uint32_t nowMs) {
-  if (nowMs - energy.lastSaveMs < ENERGY_SAVE_INTERVAL_MS) return;
-
-  PersistedEnergyData saved = { ENERGY_PERSIST_VERSION, {}, {} };
-  xSemaphoreTake(energyMutex, portMAX_DELAY);
-  const bool dirty = energy.dirty;
-  if (dirty) {
-    memcpy(saved.raw, energy.raw, sizeof(saved.raw));
-    memcpy(saved.remainderWms, energy.remainderWms, sizeof(saved.remainderWms));
-    energy.dirty = false;
-  }
-  energy.lastSaveMs = nowMs;
-  xSemaphoreGive(energyMutex);
-
-  if (dirty && prefs.putBytes("energy", &saved, sizeof(saved)) != sizeof(saved)) {
-    xSemaphoreTake(energyMutex, portMAX_DELAY);
-    energy.dirty = true;
-    xSemaphoreGive(energyMutex);
-  }
-}
-
-static void updateEnergyCounters(float p1W, float p2W, float p3W, uint32_t nowMs) {
-#if PHASE_ROTATION == 1
-  const float phasePowerW[3] = { p2W, p3W, p1W };
-#elif PHASE_ROTATION == 2
-  const float phasePowerW[3] = { p3W, p1W, p2W };
-#else
-  const float phasePowerW[3] = { p1W, p2W, p3W };
-#endif
-
-  xSemaphoreTake(energyMutex, portMAX_DELAY);
-  if (energy.lastUpdateMs != 0) {
-    const uint32_t elapsedMs = nowMs - energy.lastUpdateMs;
-    if (elapsedMs <= 2000UL) {
-      for (size_t phase = 0; phase < 3; phase++) {
-        const float powerW = phasePowerW[phase];
-        if (powerW == 0.0f) continue;
-        const size_t slot = powerW < 0.0f ? phase : phase + 3;
-        const uint64_t deltaWms = (uint64_t)(fabsf(powerW) * elapsedMs + 0.5f);
-        energy.remainderWms[slot] += deltaWms;
-        energy.raw[slot] += energy.remainderWms[slot] / ENERGY_RAW_UNIT_WMS;
-        energy.remainderWms[slot] %= ENERGY_RAW_UNIT_WMS;
-        energy.dirty = true;
-      }
-    }
-  }
-  energy.lastUpdateMs = nowMs;
-  xSemaphoreGive(energyMutex);
-
-  saveEnergyCountersIfDue(nowMs);
-}
 
 // ───────────────────────── SERIAL LOG BUFFER ─────────────────────
 // Mirrors everything printed to USB serial into a RAM ring buffer so the
@@ -497,87 +410,6 @@ static void appendCRC(uint8_t *buf, size_t len) {
   buf[len + 1] = (crc >> 8) & 0xFF;
 }
 
-// ───────────────────────── REGISTER MAP ──────────────────────────
-// S (VA, magnitude) = V x I. voltTimes10 is x0.1V, currTimes100 is x0.01A.
-static int32_t phaseApparent(uint16_t voltTimes10, uint16_t currTimes100) {
-  return (int32_t)(((uint32_t)voltTimes10 * (uint32_t)currTimes100) / 1000);
-}
-// Power factor (x0.001), signed to match the active-power import/export sign.
-static int16_t phasePF(int32_t pw, int32_t s) {
-  if (s <= 0) return 0;
-  float pf = (float)pw / (float)s;
-  if (pf > 1.0f) pf = 1.0f;
-  if (pf < -1.0f) pf = -1.0f;
-  return (int16_t)lroundf(pf * 1000.0f);
-}
-
-static uint16_t hiWord(int32_t value) {
-  return (uint16_t)((uint32_t)value >> 16);
-}
-
-static uint16_t loWord(int32_t value) {
-  return (uint16_t)value;
-}
-
-// Return the 16-bit value for one inverter meter-block register address.
-static uint16_t translateReg(const MeterData &s, uint16_t addr) {
-  int32_t Sa = phaseApparent(s.Va, s.Ia);
-  int32_t Sb = phaseApparent(s.Vb, s.Ib);
-  int32_t Sc = phaseApparent(s.Vc, s.Ic);
-  switch (addr) {
-    // Voltages (uint16, x0.1 V)
-    case 0x0132: return s.Va;
-    case 0x0133: return s.Vb;
-    case 0x0134: return s.Vc;
-    // Currents (32-bit, hi word always 0, lo word x0.01 A)
-    case 0x0135: return 0;            case 0x0136: return s.Ia;
-    case 0x0137: return 0;            case 0x0138: return s.Ib;
-    case 0x0139: return 0;            case 0x013A: return s.Ic;
-    // GMK330 active power (32-bit signed, big-endian hi/lo).
-    case 0x013B: return hiWord(s.Pa);  case 0x013C: return loWord(s.Pa);
-    case 0x013D: return hiWord(s.Pb);  case 0x013E: return loWord(s.Pb);
-    case 0x013F: return hiWord(s.Pc);  case 0x0140: return loWord(s.Pc);
-    case 0x0141: return hiWord(s.Pa + s.Pb + s.Pc);
-    case 0x0142: return loWord(s.Pa + s.Pb + s.Pc);
-    // Reactive power is unavailable from P1.
-    case 0x0143: return 0;             case 0x0144: return 0;
-    case 0x0145: return 0;             case 0x0146: return 0;
-    case 0x0147: return 0;             case 0x0148: return 0;
-    case 0x0149: return 0;             case 0x014A: return 0;
-    // Apparent power (32-bit unsigned magnitude).
-    case 0x014B: return hiWord(Sa);    case 0x014C: return loWord(Sa);
-    case 0x014D: return hiWord(Sb);    case 0x014E: return loWord(Sb);
-    case 0x014F: return hiWord(Sc);    case 0x0150: return loWord(Sc);
-    case 0x0151: return hiWord(Sa + Sb + Sc);
-    case 0x0152: return loWord(Sa + Sb + Sc);
-    // Per-phase power factor, signed x0.001.
-    case 0x0153: return (uint16_t)phasePF(s.Pa, Sa);
-    case 0x0154: return (uint16_t)phasePF(s.Pb, Sb);
-    case 0x0155: return (uint16_t)phasePF(s.Pc, Sc);
-    // 0x0156 remains near 2000 in all captured GMK330 operating states;
-    // 0x0157 is line frequency in x0.01 Hz.
-    case 0x0156: return 2000;
-    case 0x0157: return 5000;
-    // Energy totals - not used for export limiting
-    default:     return 0;
-  }
-}
-
-static uint16_t discoveryReg(uint16_t addr) {
-  switch (addr) {
-    case 0xF000: return 0x4D65;  // "Me"
-    case 0xF001: return 0x7400;  // "t\0"
-    case 0x0203: return 0x0002;
-    case 0x0204: return 0x0000;
-    case 0x0205: return 0x0BB8;
-    case 0x0206: return 0x0001;
-    case 0x0207: return 0x0008;
-    case 0x007B: return 0x0007;
-    case 0x02EE: return 0xAA55;
-    default: return 0;
-  }
-}
-
 // ───────────────────────── RS485 TX ──────────────────────────────
 static void rs485Send(const uint8_t *buf, size_t len) {
 #ifdef DEBUG_MODBUS
@@ -600,9 +432,7 @@ static void sendReadResponse(uint8_t addr, uint8_t fc, uint16_t start, uint16_t 
   xSemaphoreGive(meterMutex);
 
   uint64_t energyRaw[8] = {};
-  xSemaphoreTake(energyMutex, portMAX_DELAY);
-  memcpy(energyRaw, energy.raw, sizeof(energy.raw));
-  xSemaphoreGive(energyMutex);
+  energyCounters.snapshot(energyRaw);
 
   if (!ok) return;                     // safety hold: let the inverter time out
 
@@ -627,9 +457,9 @@ static void sendReadResponse(uint8_t addr, uint8_t fc, uint16_t start, uint16_t 
       const uint8_t word = offset % 4;
       val = (uint16_t)(energyRaw[slot] >> ((3 - word) * 16));
     } else if (addr >= 0x0132 && addr <= 0x0157) {
-      val = translateReg(snap, addr);
+      val = gmk330TranslateRegister(snap, addr);
     } else {
-      val = discoveryReg(addr);
+      val = gmk330DiscoveryRegister(addr);
     }
     buf[idx++] = (val >> 8) & 0xFF;
     buf[idx++] =  val       & 0xFF;
@@ -777,11 +607,38 @@ static String getP1Ip() {
   return ip;
 }
 
+static GridMeterConnection getGridMeterConnection() {
+  xSemaphoreTake(ipMutex, portMAX_DELAY);
+  GridMeterConnection connection = { gridMeterType, p1Ip };
+  xSemaphoreGive(ipMutex);
+  return connection;
+}
+
 static void setP1Ip(const String &ip) {
   xSemaphoreTake(ipMutex, portMAX_DELAY);
   p1Ip = ip;
   xSemaphoreGive(ipMutex);
   prefs.putString("p1ip", ip);
+}
+
+static void setGridMeterConnection(const GridMeterConnection &connection) {
+  xSemaphoreTake(ipMutex, portMAX_DELAY);
+  const bool sourceChanged = gridMeterType != connection.type || p1Ip != connection.ip;
+  gridMeterType = connection.type;
+  p1Ip = connection.ip;
+  if (sourceChanged) gridMeterGeneration = gridMeterGeneration + 1;
+  xSemaphoreGive(ipMutex);
+
+  prefs.putString("meterType", gridMeterTypeKey(connection.type));
+  prefs.putString("p1ip", connection.ip);
+
+  if (sourceChanged) {
+    xSemaphoreTake(meterMutex, portMAX_DELAY);
+    meter.valid = false;
+    meter.failCount = 0;
+    meter.lastOkMs = 0;
+    xSemaphoreGive(meterMutex);
+  }
 }
 
 struct InverterConnectionConfig {
@@ -803,10 +660,6 @@ static void setInverterConnectionConfig(const String &ip, bool enabled) {
   xSemaphoreGive(ipMutex);
   prefs.putString("invip", ip);
   prefs.putBool("inven", enabled);
-}
-
-static String buildP1Url() {
-  return "http://" + getP1Ip() + "/api/v1/data";
 }
 
 static bool isValidIp(const String &s) {
@@ -838,48 +691,22 @@ static P1FetchResult fetchP1() {
     return P1FetchResult::Failed;
   }
 
-  HTTPClient http;
-  http.begin(buildP1Url());
-  http.setTimeout(P1_HTTP_TIMEOUT);
-  int code = http.GET();
-  if (code != 200) {
-    http.end();
+  const GridMeterConnection connection = getGridMeterConnection();
+  GridMeterSample sourceSample = {};
+  int code = 0;
+  if (!fetchGridMeterSample(connection, P1_HTTP_TIMEOUT, sourceSample, code)) {
     markFail();
 #ifdef DEBUG_MODBUS
-    logPrintf("[P1] HTTP %d\n", code);
+    logPrintf("[GRID] %s HTTP/JSON failure (%d)\n", gridMeterTypeName(connection.type), code);
 #endif
-  return P1FetchResult::Failed;
-  }
-  String payload = http.getString();
-  http.end();
-
-  JsonDocument filter;
-  const char *fields[] = {
-    "active_power_w",
-    "active_power_l1_w", "active_power_l2_w", "active_power_l3_w",
-    "active_voltage_l1_v", "active_voltage_l2_v", "active_voltage_l3_v",
-    "active_current_l1_a", "active_current_l2_a", "active_current_l3_a",
-  };
-  for (const char *f : fields) filter[f] = true;
-
-  JsonDocument doc;
-  if (deserializeJson(doc, payload, DeserializationOption::Filter(filter))) {
-    markFail();
     return P1FetchResult::Failed;
   }
 
-  // Power per phase; fall back to the total if per-phase is not reported.
-  bool hasPhases = doc["active_power_l1_w"].is<float>() ||
-                   doc["active_power_l2_w"].is<float>() ||
-                   doc["active_power_l3_w"].is<float>();
-  float total = doc["active_power_w"] | 0.0f;
-  float p1, p2, p3;
-  if (!hasPhases || SPLIT_TOTAL_OVER_3PHASE) {
-    p1 = p2 = p3 = total / 3.0f;
-  } else {
-    p1 = doc["active_power_l1_w"] | 0.0f;
-    p2 = doc["active_power_l2_w"] | 0.0f;
-    p3 = doc["active_power_l3_w"] | 0.0f;
+  float p1 = sourceSample.activePowerW[0];
+  float p2 = sourceSample.activePowerW[1];
+  float p3 = sourceSample.activePowerW[2];
+  if (!sourceSample.hasPerPhasePower || SPLIT_TOTAL_OVER_3PHASE) {
+    p1 = p2 = p3 = sourceSample.totalActivePowerW / 3.0f;
   }
 
   float p1raw = p1, p2raw = p2, p3raw = p3;   // pre-negation, for the /data debug view
@@ -887,23 +714,19 @@ static P1FetchResult fetchP1() {
   static float previousPowerW[3] = {};
   static float previousVoltageV[3] = {};
   static float previousCurrentA[3] = {};
+  static uint32_t previousGeneration = UINT32_MAX;
 
-  float v1 = doc["active_voltage_l1_v"] | 230.0f;
-  float v2 = doc["active_voltage_l2_v"] | 230.0f;
-  float v3 = doc["active_voltage_l3_v"] | 230.0f;
-  float i1raw = doc["active_current_l1_a"].is<float>()
-                ? fabsf((float)doc["active_current_l1_a"])
-                : (v1 > 1 ? fabsf(p1raw) / v1 : 0);
-  float i2raw = doc["active_current_l2_a"].is<float>()
-                ? fabsf((float)doc["active_current_l2_a"])
-                : (v2 > 1 ? fabsf(p2raw) / v2 : 0);
-  float i3raw = doc["active_current_l3_a"].is<float>()
-                ? fabsf((float)doc["active_current_l3_a"])
-                : (v3 > 1 ? fabsf(p3raw) / v3 : 0);
+  float v1 = sourceSample.voltageV[0];
+  float v2 = sourceSample.voltageV[1];
+  float v3 = sourceSample.voltageV[2];
+  float i1raw = sourceSample.currentA[0];
+  float i2raw = sourceSample.currentA[1];
+  float i3raw = sourceSample.currentA[2];
   const float powerW[3] = { p1raw, p2raw, p3raw };
   const float voltageV[3] = { v1, v2, v3 };
   const float currentA[3] = { i1raw, i2raw, i3raw };
-  bool readingChanged = !previousReadingValid;
+  const uint32_t currentGeneration = gridMeterGeneration;
+  bool readingChanged = !previousReadingValid || previousGeneration != currentGeneration;
   for (size_t phase = 0; phase < 3 && !readingChanged; phase++) {
     readingChanged = powerW[phase] != previousPowerW[phase] ||
                      voltageV[phase] != previousVoltageV[phase] ||
@@ -913,9 +736,10 @@ static P1FetchResult fetchP1() {
   memcpy(previousVoltageV, voltageV, sizeof(voltageV));
   memcpy(previousCurrentA, currentA, sizeof(currentA));
   previousReadingValid = true;
+  previousGeneration = currentGeneration;
 
   const uint32_t nowMs = millis();
-  updateEnergyCounters(p1raw, p2raw, p3raw, nowMs);
+  energyCounters.update(p1raw, p2raw, p3raw, PHASE_ROTATION, nowMs);
   const float rawTotalW = p1raw + p2raw + p3raw;
   const ControlConfig config = getControlConfig();
   uint32_t controlDtMs = controlLastUpdateMs ? nowMs - controlLastUpdateMs : P1_FAILURE_RETRY_MS;
@@ -1537,6 +1361,68 @@ static void handleInverterConfig() {
     : "Inverter Modbus TCP disabled");
 }
 
+static bool parseGridMeterConnectionArgs(GridMeterConnection &connection) {
+  if (!server.hasArg("meterType") || !parseGridMeterType(server.arg("meterType"), connection.type)) {
+    return false;
+  }
+  connection.ip = server.arg("meterIp");
+  connection.ip.trim();
+  if (!isValidIp(connection.ip)) return false;
+  return true;
+}
+
+static void clearInverterDebugState() {
+  xSemaphoreTake(invMutex, portMAX_DELAY);
+  invdbg.valid = false;
+  invdbg.runValid = false;
+  invdbg.lastOkMs = 0;
+  invdbg.runLastOkMs = 0;
+  xSemaphoreGive(invMutex);
+}
+
+static void handleSettings() {
+  if (!checkAuth()) return;
+  GridMeterConnection meterConnection;
+  if (!parseGridMeterConnectionArgs(meterConnection)) {
+    server.send(400, "text/plain", "Invalid grid meter type or IP address");
+    return;
+  }
+  String inverterAddress = server.arg("inverterIp");
+  inverterAddress.trim();
+  if (!isValidIp(inverterAddress)) {
+    server.send(400, "text/plain", "Invalid inverter IP address");
+    return;
+  }
+  const bool inverterEnabled = server.arg("inverterEnabled") == "true" ||
+                               server.arg("inverterEnabled") == "1";
+  setGridMeterConnection(meterConnection);
+  setInverterConnectionConfig(inverterAddress, inverterEnabled);
+  clearInverterDebugState();
+  server.send(200, "text/plain", String(gridMeterTypeName(meterConnection.type)) +
+              " selected; waiting for a valid reading");
+}
+
+static void handleTestGridMeter() {
+  if (!checkAuth()) return;
+  GridMeterConnection connection;
+  if (!parseGridMeterConnectionArgs(connection)) {
+    server.send(400, "text/plain", "Invalid grid meter type or IP address");
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    server.send(503, "text/plain", "Wi-Fi is not connected");
+    return;
+  }
+  GridMeterSample sample = {};
+  int httpStatus = 0;
+  if (!fetchGridMeterSample(connection, P1_HTTP_TIMEOUT, sample, httpStatus)) {
+    server.send(502, "text/plain", "Grid meter test failed (HTTP " + String(httpStatus) + ")");
+    return;
+  }
+  server.send(200, "text/plain", String(gridMeterTypeName(connection.type)) +
+              " connected: " + String(lroundf(sample.totalActivePowerW)) + " W total");
+}
+
 static void handleReset() {
   if (!checkAuth()) return;
   setP1Ip(P1_IP_DEFAULT);
@@ -1632,10 +1518,13 @@ static void handleState() {
   const char *transientName = controlTransientState == 1 ? "step hold" :
                               controlTransientState == 2 ? "crossing brake" :
                               controlTransientState == 3 ? "gain ramp" : "normal";
-  char state[1024];
+  const GridMeterConnection meterConnection = getGridMeterConnection();
+  char state[1200];
   snprintf(state, sizeof(state),
            "{\"firmwareVersion\":\"%s\",\"paused\":%s,\"downloadReady\":%s,\"sd\":%s,\"p1Reachable\":%s,"
-           "\"p1AgeMs\":%lu,\"p1Ip\":\"%s\",\"inverterListening\":%s,"
+           "\"p1AgeMs\":%lu,\"p1Ip\":\"%s\",\"gridMeterType\":\"%s\","
+           "\"gridMeterName\":\"%s\","
+           "\"inverterListening\":%s,"
            "\"inverterModbusEnabled\":%s,\"inverterModbusOk\":%s,"
            "\"inverterModbusAgeMs\":%lu,\"inverterIp\":\"%s\","
            "\"bias\":%.2f,\"averageRaw\":%.1f,\"effectiveGain\":%.3f,\"transient\":\"%s\","
@@ -1647,7 +1536,8 @@ static void handleState() {
            FIRMWARE_VERSION, maintenancePaused ? "true" : "false",
            sdPauseAcknowledged ? "true" : "false",
            sdReady ? "true" : "false", p1Reachable ? "true" : "false",
-           (unsigned long)p1Age, getP1Ip().c_str(), inverterListening ? "true" : "false",
+           (unsigned long)p1Age, meterConnection.ip.c_str(), gridMeterTypeKey(meterConnection.type),
+           gridMeterTypeName(meterConnection.type), inverterListening ? "true" : "false",
            inverterConfig.enabled ? "true" : "false", inverterModbusOk ? "true" : "false",
            (unsigned long)inverterModbusAge, inverterConfig.ip.c_str(),
            controlBiasW, controlAverageRawW,
@@ -2107,7 +1997,6 @@ void setup() {
   xTaskCreatePinnedToCore(ledTask, "led", 2048, nullptr, 1, nullptr, 0);
 
   meterMutex = xSemaphoreCreateMutex();
-  energyMutex = xSemaphoreCreateMutex();
   ipMutex     = xSemaphoreCreateMutex();
   invMutex    = xSemaphoreCreateMutex();
   sdMutex     = xSemaphoreCreateMutex();
@@ -2115,8 +2004,14 @@ void setup() {
   sdLogQueue  = xQueueCreate(SD_LOG_QUEUE_LEN, sizeof(SdLogSample));
   sdSpi.begin(SD_SCLK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
   prefs.begin("p1cfg", false);
-  loadEnergyCounters();
+  prefs.remove("meterUser");
+  prefs.remove("meterPass");
+  energyCounters.begin(prefs);
   p1Ip = prefs.getString("p1ip", P1_IP_DEFAULT);
+  GridMeterType savedMeterType;
+  if (parseGridMeterType(prefs.getString("meterType", "homewizard"), savedMeterType)) {
+    gridMeterType = savedMeterType;
+  }
   inverterIp = prefs.getString("invip", INVERTER_IP_DEFAULT);
   inverterModbusEnabled = prefs.getBool("inven", true);
   if (prefs.getUChar("ctrlVer", 0) < CONTROL_CONFIG_VERSION) {
@@ -2162,6 +2057,8 @@ void setup() {
   server.on("/save",  HTTP_POST, handleSave);
   server.on("/p1ip", HTTP_POST, handleP1Ip);
   server.on("/inverter/config", HTTP_POST, handleInverterConfig);
+  server.on("/settings", HTTP_POST, handleSettings);
+  server.on("/settings/test-meter", HTTP_POST, handleTestGridMeter);
   server.on("/inverter/status", HTTP_GET, handleInverterStatus);
   server.on("/reset", HTTP_POST, handleReset);
   server.on("/control", HTTP_POST, handleControl);
