@@ -36,7 +36,7 @@
 #include "web_index.h"
 
 // ───────────────────────── USER SETTINGS ─────────────────────────
-#define FIRMWARE_VERSION "1.0.1"
+#define FIRMWARE_VERSION "1.0.2"
 
 // Default P1 IP, used only until a value is saved via the web config page.
 #define P1_IP_DEFAULT    "192.168.1.252"
@@ -55,10 +55,12 @@
 #define INVERTER_TCP_TIMEOUT  800    // ms
 #define INVERTER_STATUS_TIMEOUT_MS 6000
 
-// How often to pull fresh data from the P1 (ms). The DSMR telegram only
-// refreshes ~1x/s, so <500 ms gains nothing; 500 ms keeps data fresh.
-#define P1_POLL_MS       500
-#define P1_HTTP_TIMEOUT  700          // must be < P1_POLL_MS
+// HomeWizard publishes roughly once per second. After detecting changed data,
+// wait near the next expected refresh, then probe rapidly until it appears.
+#define P1_REFRESH_WAIT_MS  800
+#define P1_PROBE_MS         100
+#define P1_FAILURE_RETRY_MS 500
+#define P1_HTTP_TIMEOUT     700
 #define P1_MAX_FAILS     4            // stop answering inverter after N fails
 
 // The GMK330 0x0501 block stores energy in 0.01 kWh increments. Persist at a
@@ -823,11 +825,17 @@ static int8_t controlSign(float value) {
   return value > 0.0f ? 1 : (value < 0.0f ? -1 : 0);
 }
 
-static void fetchP1() {
+enum class P1FetchResult : uint8_t {
+  Failed,
+  Unchanged,
+  Changed
+};
+
+static P1FetchResult fetchP1() {
   if (WiFi.status() != WL_CONNECTED) {
     WiFi.reconnect();
     markFail();
-    return;
+    return P1FetchResult::Failed;
   }
 
   HTTPClient http;
@@ -840,7 +848,7 @@ static void fetchP1() {
 #ifdef DEBUG_MODBUS
     logPrintf("[P1] HTTP %d\n", code);
 #endif
-    return;
+  return P1FetchResult::Failed;
   }
   String payload = http.getString();
   http.end();
@@ -857,7 +865,7 @@ static void fetchP1() {
   JsonDocument doc;
   if (deserializeJson(doc, payload, DeserializationOption::Filter(filter))) {
     markFail();
-    return;
+    return P1FetchResult::Failed;
   }
 
   // Power per phase; fall back to the total if per-phase is not reported.
@@ -875,13 +883,43 @@ static void fetchP1() {
   }
 
   float p1raw = p1, p2raw = p2, p3raw = p3;   // pre-negation, for the /data debug view
+  static bool previousReadingValid = false;
+  static float previousPowerW[3] = {};
+  static float previousVoltageV[3] = {};
+  static float previousCurrentA[3] = {};
+
+  float v1 = doc["active_voltage_l1_v"] | 230.0f;
+  float v2 = doc["active_voltage_l2_v"] | 230.0f;
+  float v3 = doc["active_voltage_l3_v"] | 230.0f;
+  float i1raw = doc["active_current_l1_a"].is<float>()
+                ? fabsf((float)doc["active_current_l1_a"])
+                : (v1 > 1 ? fabsf(p1raw) / v1 : 0);
+  float i2raw = doc["active_current_l2_a"].is<float>()
+                ? fabsf((float)doc["active_current_l2_a"])
+                : (v2 > 1 ? fabsf(p2raw) / v2 : 0);
+  float i3raw = doc["active_current_l3_a"].is<float>()
+                ? fabsf((float)doc["active_current_l3_a"])
+                : (v3 > 1 ? fabsf(p3raw) / v3 : 0);
+  const float powerW[3] = { p1raw, p2raw, p3raw };
+  const float voltageV[3] = { v1, v2, v3 };
+  const float currentA[3] = { i1raw, i2raw, i3raw };
+  bool readingChanged = !previousReadingValid;
+  for (size_t phase = 0; phase < 3 && !readingChanged; phase++) {
+    readingChanged = powerW[phase] != previousPowerW[phase] ||
+                     voltageV[phase] != previousVoltageV[phase] ||
+                     currentA[phase] != previousCurrentA[phase];
+  }
+  memcpy(previousPowerW, powerW, sizeof(powerW));
+  memcpy(previousVoltageV, voltageV, sizeof(voltageV));
+  memcpy(previousCurrentA, currentA, sizeof(currentA));
+  previousReadingValid = true;
 
   const uint32_t nowMs = millis();
   updateEnergyCounters(p1raw, p2raw, p3raw, nowMs);
   const float rawTotalW = p1raw + p2raw + p3raw;
   const ControlConfig config = getControlConfig();
-  uint32_t controlDtMs = controlLastUpdateMs ? nowMs - controlLastUpdateMs : P1_POLL_MS;
-  if (controlDtMs > 2000) controlDtMs = P1_POLL_MS;
+  uint32_t controlDtMs = controlLastUpdateMs ? nowMs - controlLastUpdateMs : P1_FAILURE_RETRY_MS;
+  if (controlDtMs > 2000) controlDtMs = P1_FAILURE_RETRY_MS;
   controlLastUpdateMs = nowMs;
 
   if (!controlInitialized) {
@@ -956,20 +994,7 @@ static void fetchP1() {
   p3 = -p3 * controlEffectiveGain + phaseBiasW;
 
   // Voltages default to 230 V so the inverter never sees a "dead phase".
-  float v1 = doc["active_voltage_l1_v"] | 230.0f;
-  float v2 = doc["active_voltage_l2_v"] | 230.0f;
-  float v3 = doc["active_voltage_l3_v"] | 230.0f;
-
-  // Currents from the P1 if present, otherwise derived from |P| / V.
-  float i1raw = doc["active_current_l1_a"].is<float>()
-                ? fabsf((float)doc["active_current_l1_a"])
-                : (v1 > 1 ? fabsf(p1raw) / v1 : 0);
-  float i2raw = doc["active_current_l2_a"].is<float>()
-                ? fabsf((float)doc["active_current_l2_a"])
-                : (v2 > 1 ? fabsf(p2raw) / v2 : 0);
-  float i3raw = doc["active_current_l3_a"].is<float>()
-                ? fabsf((float)doc["active_current_l3_a"])
-                : (v3 > 1 ? fabsf(p3raw) / v3 : 0);
+  // Currents come from P1 when available and otherwise use |P| / V.
   float i1 = i1raw * controlEffectiveGain;
   float i2 = i2raw * controlEffectiveGain;
   float i3 = i3raw * controlEffectiveGain;
@@ -1003,7 +1028,9 @@ static void fetchP1() {
   p1dbg.p[0] = p1raw; p1dbg.p[1] = p2raw; p1dbg.p[2] = p3raw;
   xSemaphoreGive(meterMutex);
 
-  if (sdLogQueue && sdReady) {
+  static uint32_t lastCsvSampleMs = 0;
+  const bool csvSampleDue = readingChanged || nowMs - lastCsvSampleMs >= 1000UL;
+  if (csvSampleDue && sdLogQueue && sdReady) {
     SdLogSample sample = {};
     sample.uptimeMs = millis();
     const time_t currentTime = time(nullptr);
@@ -1047,18 +1074,25 @@ static void fetchP1() {
     sample.transientState = controlTransientState;
     sample.controlHeld = controlHeld;
 
-    if (xQueueSend(sdLogQueue, &sample, 0) != pdTRUE) sdDroppedRows = sdDroppedRows + 1;
+    if (xQueueSend(sdLogQueue, &sample, 0) != pdTRUE) {
+      sdDroppedRows = sdDroppedRows + 1;
+    } else {
+      lastCsvSampleMs = nowMs;
+    }
   }
 
-  ledPulse(0, 40, 0);
+  if (readingChanged) ledPulse(0, 40, 0);
 
 #ifdef DEBUG_MODBUS
   // Values here use the same (negated) sign convention as what's sent to the
   // inverter, so the log matches what it actually sees.
-  logPrintf("[P1] P=%d/%d/%d W  V=%.1f/%.1f/%.1f  total=%.0f W\n",
-            (int)meter.Pa, (int)meter.Pb, (int)meter.Pc, v1, v2, v3,
-            (float)(meter.Pa + meter.Pb + meter.Pc));
+  if (readingChanged) {
+    logPrintf("[P1] P=%d/%d/%d W  V=%.1f/%.1f/%.1f  total=%.0f W\n",
+              (int)meter.Pa, (int)meter.Pb, (int)meter.Pc, v1, v2, v3,
+              (float)(meter.Pa + meter.Pb + meter.Pc));
+  }
 #endif
+  return readingChanged ? P1FetchResult::Changed : P1FetchResult::Unchanged;
 }
 
 // Reads the inverter's own grid-meter view over Modbus TCP: both
@@ -2005,8 +2039,15 @@ static void p1Task(void *) {
       vTaskDelay(pdMS_TO_TICKS(100));
       continue;
     }
-    fetchP1();
-    vTaskDelay(pdMS_TO_TICKS(P1_POLL_MS));
+    const uint32_t requestStartedMs = millis();
+    const P1FetchResult result = fetchP1();
+    const uint32_t intervalMs = result == P1FetchResult::Changed
+                                  ? P1_REFRESH_WAIT_MS
+                                  : result == P1FetchResult::Unchanged
+                                    ? P1_PROBE_MS
+                                    : P1_FAILURE_RETRY_MS;
+    const uint32_t elapsedMs = millis() - requestStartedMs;
+    if (elapsedMs < intervalMs) vTaskDelay(pdMS_TO_TICKS(intervalMs - elapsedMs));
   }
 }
 

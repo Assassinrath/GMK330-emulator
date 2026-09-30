@@ -83,6 +83,13 @@ settings, current controller state, a rolling grid-power graph, diagnostics,
 pause/resume controls, and CSV downloads. Saved settings are retained in ESP32
 Preferences.
 
+P1 acquisition uses adaptive polling. After changed measurements are detected,
+the firmware waits 800 ms and then requests data every 100 ms until the next
+change appears. This normally detects each one-second HomeWizard refresh within
+about 100 ms without continuously making ten requests per second. The API has no
+source timestamp, so identical consecutive measurements cannot be recognized as
+a new refresh; probing continues at 100 ms until a value changes.
+
 Inverter Modbus TCP diagnostics are enabled by default. Use **Configure Inverter
 Modbus** to change the inverter IP or disable these read-only diagnostics. This
 setting does not disable the RS485 meter emulator. The status section at the
