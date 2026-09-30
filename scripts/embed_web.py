@@ -5,7 +5,7 @@ from pathlib import Path
 
 project_dir = Path(env["PROJECT_DIR"])
 source_path = project_dir / "data" / "index.html"
-generated_dir = Path(env.subst("$BUILD_DIR")) / "generated"
+generated_dir = project_dir / ".pio" / "generated"
 header_path = generated_dir / "web_index.h"
 
 html = source_path.read_bytes()
