@@ -2,7 +2,12 @@
 
 [Download the latest firmware release](https://github.com/GerritPost/GMK330-emulator/releases/latest)
 
-<img width="300" alt="GMK330 Emulator" src="https://github.com/user-attachments/assets/a9951ab7-61fb-45b7-aec6-81745c2e638b" />
+## Diagram
+<img width="300" alt="GMK330 Emulator webpage" src="https://github.com/user-attachments/assets/a9951ab7-61fb-45b7-aec6-81745c2e638b" />
+
+## Diagram
+<img width="1200" alt="GMK330 Diagram" src="https://github.com/user-attachments/assets/e45c2356-e3d5-4d22-9df2-c6ebd140b4f4" />
+
 
 Firmware for a LilyGo T-CAN485 that reads a HomeWizard P1, Shelly 3EM,
 Shelly Pro 3EM, or Shelly EM Mini Gen4 over Wi-Fi and emulates a GoodWe GMK330
